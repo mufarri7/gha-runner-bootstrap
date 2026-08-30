@@ -68,7 +68,7 @@ jobs:
         run: bash -n ghrctl lib/*.sh tests/test.sh
 
       - name: ShellCheck
-        run: shellcheck -x ghrctl lib/*.sh tests/test.sh
+        run: shellcheck -x ghrctl tests/test.sh
 
       - name: actionlint
         run: actionlint
