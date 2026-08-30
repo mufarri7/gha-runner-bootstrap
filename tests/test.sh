@@ -62,7 +62,8 @@ if find "$RESTORE_TMP/extract" -type f \( -name '.runner' -o -name '.credentials
 fi
 
 make_malicious_backup() {
-  local kind="$1" output="$2" tar_file="$TMP/${kind}.tar"
+  local kind="$1" output="$2" tar_file
+  tar_file="$TMP/${kind}.tar"
   python3 - "$kind" "$tar_file" <<'PY'
 import io
 import json
