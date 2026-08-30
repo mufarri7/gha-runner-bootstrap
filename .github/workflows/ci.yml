@@ -8,17 +8,98 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SHELLCHECK_VERSION: 0.11.0
+  SHELLCHECK_ARCHIVE_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+  ACTIONLINT_VERSION: 1.7.12
+  ACTIONLINT_ARCHIVE_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
 jobs:
-  shell:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y shellcheck jq zstd
+
+      - name: Install base validation dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq zstd
+
+      - name: Install pinned ShellCheck and actionlint
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin" "${RUNNER_TEMP}/downloads" "${RUNNER_TEMP}/extract"
+
+          shellcheck_archive="${RUNNER_TEMP}/downloads/shellcheck.tar.gz"
+          curl -fsSL --retry 3 \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz" \
+            -o "${shellcheck_archive}"
+          printf '%s  %s\n' "${SHELLCHECK_ARCHIVE_SHA256}" "${shellcheck_archive}" | sha256sum -c --strict
+          tar -xzf "${shellcheck_archive}" -C "${RUNNER_TEMP}/extract"
+          install -m 0755 \
+            "${RUNNER_TEMP}/extract/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" \
+            "${RUNNER_TEMP}/bin/shellcheck"
+
+          actionlint_archive="${RUNNER_TEMP}/downloads/actionlint.tar.gz"
+          curl -fsSL --retry 3 \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            -o "${actionlint_archive}"
+          printf '%s  %s\n' "${ACTIONLINT_ARCHIVE_SHA256}" "${actionlint_archive}" | sha256sum -c --strict
+          tar -xzf "${actionlint_archive}" -C "${RUNNER_TEMP}/extract"
+          install -m 0755 "${RUNNER_TEMP}/extract/actionlint" "${RUNNER_TEMP}/bin/actionlint"
+
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify repository hygiene
+        run: |
+          set -euo pipefail
+          git diff --check
+          test -x ghrctl
+          test -x tests/test.sh
+          find examples -type f -name '*.json' -print0 | xargs -0 -r -n1 jq -e . >/dev/null
+
       - name: Bash syntax
         run: bash -n ghrctl lib/*.sh tests/test.sh
+
       - name: ShellCheck
         run: shellcheck -x ghrctl tests/test.sh
+
+      - name: actionlint
+        run: actionlint
+
       - name: Functional tests
-        run: sudo ./tests/test.sh
+        run: sudo --preserve-env=GITHUB_ACTIONS ./tests/test.sh
+
+      - name: Non-root static inspection smoke test
+        run: |
+          set -euo pipefail
+          test_home="$(mktemp -d)"
+          chown nobody:nogroup "${test_home}"
+          sudo -u nobody env \
+            HOME="${test_home}" \
+            GHRCTL_STATE_DIR="${test_home}/state" \
+            GHRCTL_DATA_DIR="${test_home}/data" \
+            GHRCTL_LOG_DIR="${test_home}/logs" \
+            GHRCTL_LOCK_FILE="${test_home}/ghrctl.lock" \
+            GHRCTL_BASE_ROOT="${test_home}/runners" \
+            bash -c '
+              set -Eeuo pipefail
+              source ./ghrctl
+              test "$(sanitize_slug "My Project")" = "my-project"
+              test "$(recommend_swap_mib 8192 50000 100000)" = "4096"
+              static_scan_python | python3 - ./tests/fixtures/mixed-repo owner/repo main deadbeef | jq -e ".static_only == true" >/dev/null
+            '
+
+      - name: Reject committed GitHub token shapes
+        run: |
+          set -euo pipefail
+          if git grep -En '(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' -- . ':(exclude).github/workflows/ci.yml'; then
+            echo 'Potential GitHub credential committed.' >&2
+            exit 1
+          fi
