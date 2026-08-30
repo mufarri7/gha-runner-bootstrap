@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a reproducible problem in the public beta.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove tokens, runner credentials, repository secrets, customer data, and private log content before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: ghrctl version
+      placeholder: 0.2.0-beta.1
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Host platform
+      description: Distribution, release, architecture, RAM, and storage.
+      placeholder: Ubuntu 24.04, x86_64, 8 GiB RAM, 100 GiB disk
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and scenario
+      description: Include whether this was a fresh host, new project, additional runner, backup, or restore.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted diagnostics
+      description: Prefer `sudo ./ghrctl doctor` output with all sensitive values removed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed all credentials, tokens, secrets, private URLs, and customer data.
+          required: true
+        - label: I reproduced this on the latest beta branch or documented why I could not.
+          required: true

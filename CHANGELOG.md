@@ -2,36 +2,37 @@
 
 All notable changes to this project are documented here.
 
-The project follows semantic versioning after `1.0.0`. Pre-1.0 beta versions may change the CLI and state schema.
-
-## [Unreleased]
-
-- No stable release has been published.
+The project follows semantic-versioning intent, but pre-1.0 beta interfaces and state schemas may change while the tool is tested on clean and existing CI hosts.
 
 ## [0.2.0-beta.1] - 2026-08-30
 
+First reviewable public beta.
+
 ### Added
 
-- Public beta command-line and interactive runner manager.
-- Dynamic RAM/disk-aware swap recommendation.
-- Static repository requirement scanner with an automatic-install allowlist.
-- Optional verified project-local Node.js and common CI tool installation.
-- Rootless Docker trust boundary per repository.
-- Multiple isolated runner instances per repository.
-- Runner drain, resume, removal, binary upgrade, repair, and adoption commands.
-- Operation journal and interrupted-operation resume.
-- Secret-free project and managed-host backup/restore archives with checksums.
-- Online verification through authenticated GitHub CLI when available.
-- Automated Bash syntax, ShellCheck, and functional tests.
+- Interactive and idempotent Ubuntu/Debian CI host bootstrap.
+- Repository-scoped trust boundaries using restricted Linux users and Rootless Docker.
+- Multiple isolated runner installations per repository.
+- Static, non-executing repository requirement analysis and allowlisted tool planning.
+- Dynamic swap sizing based on RAM and root-filesystem headroom.
+- Project and full managed-host secret-free migration backups.
+- Resumable restore with fresh runner registrations and missing-runner reconciliation.
+- Runner lifecycle commands for doctor, repair, drain, resume, remove, upgrade, adoption, and online verification.
+- Operation journaling, dry-run mode, JSON output, and beta self-update controls.
+- Security, architecture, analysis, backup/restore, contribution, and issue-reporting documentation.
+- Pinned, checksum-verified ShellCheck and actionlint CI validation.
 
 ### Security
 
-- Project state moved from sourceable shell assignments to validated JSON.
-- Backup archives explicitly reject credential material and unsafe paths.
-- Repository scanning never executes repository code.
-- Automatic host packages are restricted to an explicit allowlist.
+- Runner users are rejected when they belong to `sudo`, `wheel`, or `docker`.
+- Managed runners use per-project Rootless Docker sockets rather than `/var/run/docker.sock`.
+- Repository scanning never executes target-repository code.
+- Backup validation rejects traversal paths, symbolic links, hard links, devices, FIFOs, unexpected members, oversized payloads, and checksum mismatches before restore.
+- Tokens, runner credentials, workspaces, Docker layers, and repository secrets are excluded from state and default backups.
 
-## [0.1.0] - 2026-08-30
+### Beta limitations
 
-- Internal prototype used to validate the initial host and rootless-runner architecture.
-- Not published as a formal release.
+- No stable tag or GitHub Release is published by this change.
+- Supported hosts are Ubuntu/Debian systems using `apt` and systemd.
+- Supported runners are persistent GitHub.com repository-level runners.
+- Organization/enterprise runner groups and JIT/ephemeral workers remain roadmap items.
