@@ -12,8 +12,12 @@ source "${GHRCTL_ROOT}/lib/state.sh"
 source "${GHRCTL_ROOT}/lib/host.sh"
 # shellcheck source=lib/scanner.sh
 source "${GHRCTL_ROOT}/lib/scanner.sh"
+# shellcheck source=lib/project.sh
+source "${GHRCTL_ROOT}/lib/project.sh"
 # shellcheck source=lib/runner.sh
 source "${GHRCTL_ROOT}/lib/runner.sh"
+# shellcheck source=lib/operations.sh
+source "${GHRCTL_ROOT}/lib/operations.sh"
 # shellcheck source=lib/backup.sh
 source "${GHRCTL_ROOT}/lib/backup.sh"
 # shellcheck source=lib/cli.sh
