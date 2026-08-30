@@ -106,7 +106,9 @@ create_backup_archive() {
   mv "$checksum_file" "$work/payload/SHA256SUMS"
 
   tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-    -C "$work/payload" -cf - . | zstd -T0 -19 -o "$destination"
+    -C "$work/payload" -cf - \
+    backup.json manifest.json SHA256SUMS projects profiles inventory \
+    | zstd -T0 -19 -o "$destination"
   chmod 600 "$destination"
   rm -rf "$work"
   success "Created secret-free ${kind} migration backup: $destination"
