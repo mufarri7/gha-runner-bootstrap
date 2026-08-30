@@ -235,10 +235,10 @@ See [Security model](docs/security-model.md) and [SECURITY.md](SECURITY.md).
 
 ```bash
 bash -n ghrctl
-./tests/test.sh
+sudo ./tests/test.sh
 ```
 
-The repository CI also runs ShellCheck.
+The functional suite redirects all managed state into temporary directories while exercising the root-gated public entry points. The repository CI also runs ShellCheck.
 
 ## License
 

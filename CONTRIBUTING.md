@@ -6,9 +6,11 @@
 
 ```bash
 bash -n ghrctl
-./tests/test.sh
+sudo ./tests/test.sh
 shellcheck -x ghrctl tests/test.sh
 ```
+
+The functional suite intentionally runs with `sudo` because it exercises root-gated backup and state-management entry points. All test state is redirected to temporary directories.
 
 ## Pull requests
 

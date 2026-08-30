@@ -21,4 +21,4 @@ jobs:
       - name: ShellCheck
         run: shellcheck -x ghrctl tests/test.sh
       - name: Functional tests
-        run: ./tests/test.sh
+        run: sudo ./tests/test.sh
