@@ -124,7 +124,8 @@ import tarfile
 archive = pathlib.Path(sys.argv[1])
 max_members = 10_000
 max_file_bytes = 64 * 1024 * 1024
-allowed_roots = {"backup.json", "manifest.json", "SHA256SUMS", "projects", "profiles", "inventory"}
+descriptor_roots = {"projects", "profiles", "inventory"}
+allowed_roots = {"backup.json", "manifest.json", "SHA256SUMS"} | descriptor_roots
 
 def normalized(name: str) -> pathlib.PurePosixPath:
     if not name or "\\" in name or "\x00" in name:
@@ -136,7 +137,7 @@ def normalized(name: str) -> pathlib.PurePosixPath:
         raise ValueError(f"unsafe archive path: {name!r}")
     if path.parts[0] not in allowed_roots:
         raise ValueError(f"unexpected backup path: {name!r}")
-    if path.parts[0] in {"projects", "profiles", "inventory"}:
+    if path.parts[0] in descriptor_roots:
         if len(path.parts) != 2 or not path.name.endswith(".json"):
             raise ValueError(f"unexpected descriptor path: {name!r}")
     elif len(path.parts) != 1:
@@ -149,9 +150,14 @@ with tarfile.open(archive, "r:") as tf:
         raise ValueError("backup contains too many archive members")
     total = 0
     for member in members:
+        display_name = member.name
+        while display_name.startswith("./"):
+            display_name = display_name[2:]
+        if member.isdir() and display_name in descriptor_roots:
+            continue
         normalized(member.name)
         if member.isdir():
-            continue
+            raise ValueError(f"unexpected backup directory: {member.name!r}")
         if not member.isfile():
             raise ValueError(f"backup contains a link, device, fifo, or unsupported member: {member.name!r}")
         if member.size < 0:
