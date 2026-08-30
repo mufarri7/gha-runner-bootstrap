@@ -1,0 +1,122 @@
+name: Assemble public beta candidate
+
+on:
+  push:
+    branches: [feat/public-beta]
+    paths:
+      - .bootstrap/ghrctl-public-beta-src.tar.gz
+      - .github/workflows/publish-beta-candidate.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ghrctl-public-beta-import
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    if: github.repository == 'mufarri7/gha-runner-bootstrap'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SOURCE_SHA256: f0dd0ae1c394cea84417c0093e9d21d2b74dbe06e35d08c16279ef375b270862
+      TARGET_BRANCH: feat/public-beta-ready
+    steps:
+      - name: Checkout the import branch
+        uses: actions/checkout@v4
+        with:
+          path: import
+          persist-credentials: false
+
+      - name: Verify and extract the reviewed source bundle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="${GITHUB_WORKSPACE}/import/.bootstrap/ghrctl-public-beta-src.tar.gz"
+          printf '%s  %s\n' "${SOURCE_SHA256}" "${archive}" | sha256sum --check --strict
+          mkdir -p "${GITHUB_WORKSPACE}/source"
+          tar -xzf "${archive}" -C "${GITHUB_WORKSPACE}/source"
+          test -x "${GITHUB_WORKSPACE}/source/ghrctl"
+
+      - name: Validate source before publishing
+        shell: bash
+        working-directory: source
+        run: |
+          set -Eeuo pipefail
+          bash -n ghrctl lib/ghrctl/*.sh tests/*.sh
+          ./tests/run.sh
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          for path in Path('examples').glob('*.json'):
+              json.loads(path.read_text())
+          PY
+          if grep -RInE --exclude-dir=.git \
+            'gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}' .; then
+            echo 'Potential GitHub token shape found in the source bundle.' >&2
+            exit 1
+          fi
+
+      - name: Checkout the clean main baseline
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          path: publish
+          token: ${{ github.token }}
+
+      - name: Build reviewable public-beta commits
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source_dir="${GITHUB_WORKSPACE}/source"
+          publish_dir="${GITHUB_WORKSPACE}/publish"
+
+          cd "${publish_dir}"
+          if git ls-remote --exit-code origin "refs/heads/${TARGET_BRANCH}" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing branch ${TARGET_BRANCH}." >&2
+            exit 1
+          fi
+
+          git switch -c "${TARGET_BRANCH}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          rsync -a --delete --exclude='.git/' "${source_dir}/" "${publish_dir}/"
+
+          git add \
+            ghrctl \
+            lib/ghrctl/core.sh \
+            lib/ghrctl/state.sh \
+            lib/ghrctl/system.sh \
+            lib/ghrctl/github.sh \
+            lib/ghrctl/runners.sh \
+            lib/ghrctl/self_update.sh \
+            lib/ghrctl/cli.sh
+          git commit -m 'feat(core): add isolated runner host management'
+
+          git add \
+            lib/ghrctl/analyze.sh \
+            lib/ghrctl/backup.sh \
+            examples
+          git commit -m 'feat(analysis): add repository planning and migration backups'
+
+          git add \
+            .editorconfig \
+            .gitattributes \
+            .gitignore \
+            .shellcheckrc \
+            .github \
+            tests
+          git commit -m 'test(ci): add beta validation and safety coverage'
+
+          git add -A
+          git commit -m 'docs: publish the public beta operating guide'
+
+          test -z "$(git status --porcelain)"
+          diff -qr --exclude='.git' "${source_dir}" "${publish_dir}"
+          test "$(git rev-list --count main..HEAD)" = '4'
+          git log --oneline --reverse main..HEAD
+
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
