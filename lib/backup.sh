@@ -1,7 +1,11 @@
+# shellcheck shell=bash
+
 runner_inventory_json() {
   local slug="$1" dir service version
   load_project "$slug"
-  local tmp; tmp="$(mktemp)"; printf '[]' >"$tmp"
+  local tmp
+  tmp="$(mktemp)"
+  printf '[]' >"$tmp"
   while IFS= read -r dir; do
     service="$(runner_service_from_dir "$dir")"
     version="$(runuser -u "$RUNNER_USER" -- "$dir/bin/Runner.Listener" --version 2>/dev/null || true)"
@@ -19,9 +23,11 @@ runner_inventory_json() {
 }
 
 export_manifest() {
-  need_root; init_dirs
+  need_root
+  init_dirs
   local only_slug="${1:-}" tmp file slug count rendered swap
-  tmp="$(mktemp)"; printf '[]' >"$tmp"
+  tmp="$(mktemp)"
+  printf '[]' >"$tmp"
   shopt -s nullglob
   for file in "$PROJECTS_DIR"/*.json; do
     slug="$(jq -r .slug "$file")"
@@ -45,9 +51,8 @@ export_manifest() {
 }
 
 safe_archive_name() {
-  local name="$1"
-  [[ -n "$name" && "$name" != /* && "$name" != *'\\'* && "$name" != *$'\0'* ]] || return 1
-  local part
+  local name="$1" part
+  [[ -n "$name" && "$name" != /* && "$name" != *\\* ]] || return 1
   IFS='/' read -r -a _archive_parts <<<"${name#./}"
   for part in "${_archive_parts[@]}"; do
     [[ -n "$part" && "$part" != '.' && "$part" != '..' ]] || return 1
@@ -56,8 +61,10 @@ safe_archive_name() {
 }
 
 create_backup_archive() {
-  local kind="$1" slug="$2" destination="$3" work
-  need_root; init_dirs; have zstd || die "zstd is required. Run bootstrap-host."
+  local kind="$1" slug="$2" destination="$3" work checksum_file
+  need_root
+  init_dirs
+  have zstd || die "zstd is required. Run bootstrap-host."
   [[ "$kind" == "project" || "$kind" == "server" ]] || die "Backup kind must be project or server."
   mkdir -p "$(dirname "$destination")"
   work="$(mktemp -d "${BACKUP_WORK_DIR}/backup.XXXXXX")"
@@ -91,10 +98,13 @@ create_backup_archive() {
     '{schema_version:$schema_version,kind:$kind,project:(if $project=="" then null else $project end),created_at:$created_at,ghrctl_version:$version,secret_free:true,excludes:["runner credentials","runner registration state","workspaces","Docker layers/volumes","GitHub tokens","PATs","repository secrets"]}' \
     >"$work/payload/backup.json"
 
+  checksum_file="$work/SHA256SUMS"
   (
-    cd "$work/payload"
-    find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
-  )
+    cd "$work/payload" || exit
+    find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum
+  ) >"$checksum_file"
+  mv "$checksum_file" "$work/payload/SHA256SUMS"
+
   tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
     -C "$work/payload" -cf - . | zstd -T0 -19 -o "$destination"
   chmod 600 "$destination"
@@ -204,7 +214,9 @@ validate_backup_archive() {
 }
 
 restore_backup_archive() {
-  need_root; acquire_lock; os_check
+  need_root
+  acquire_lock
+  os_check
   local archive="$1" requested_kind="${2:-}" work kind manifest
   [[ -r "$archive" ]] || die "Backup not found: $archive"
   work="$(mktemp -d "${BACKUP_WORK_DIR}/restore.XXXXXX")"
@@ -225,7 +237,9 @@ restore_backup_archive() {
 }
 
 restore_manifest() {
-  need_root; acquire_lock; os_check
+  need_root
+  acquire_lock
+  os_check
   local manifest="${1:-}" slug repo repo_full user base labels rootless count scan_ref project existing missing index
   [[ -r "$manifest" ]] || die "Manifest file not found: $manifest"
   jq -e '(.schema_version==2) and (.projects|type=="array") and (.secret_free==true)' "$manifest" >/dev/null || die "Unsupported manifest."
@@ -272,7 +286,9 @@ restore_manifest() {
 }
 
 adopt_existing() {
-  need_root; acquire_lock; init_dirs
+  need_root
+  acquire_lock
+  init_dirs
   local base="${1:-$BASE_ROOT}" dir runner_json repo_url repo_full slug user project_base labels
   while IFS= read -r dir; do
     runner_json="$dir/.runner"
