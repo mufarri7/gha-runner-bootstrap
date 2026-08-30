@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "generated_by": "ghrctl 0.2.0-beta.1",
+  "generated_at": "2026-08-30T00:00:00Z",
+  "secret_free": true,
+  "host": {
+    "ram_mib": 8192,
+    "disk_available_mib": 90000,
+    "disk_total_mib": 100000,
+    "recommended_swap_mib": 4096,
+    "policy": "example"
+  },
+  "projects": [
+    {
+      "schema_version": 2,
+      "slug": "redeemapi",
+      "target_type": "repository",
+      "repo_url": "https://github.com/example/redeemapi",
+      "repo_full_name": "example/redeemapi",
+      "runner_user": "gha-redeemapi",
+      "base_dir": "/srv/github-runners/redeemapi",
+      "labels": ["redeemapi-ci", "shared-ci"],
+      "rootless_docker": true,
+      "scan_ref": "main",
+      "runner_count": 2
+    }
+  ]
+}
