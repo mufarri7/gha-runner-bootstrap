@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 runner_inventory_json() {
   local slug="$1" dir service version
   load_project "$slug"
@@ -53,7 +54,13 @@ create_backup_archive() {
   fi
   jq -n --argjson schema_version "$BACKUP_SCHEMA_VERSION" --arg kind "$kind" --arg project "$slug" --arg created_at "$(utc_now)" --arg version "$GHRCTL_VERSION" \
     '{schema_version:$schema_version,kind:$kind,project:(if $project=="" then null else $project end),created_at:$created_at,ghrctl_version:$version,secret_free:true,excludes:["runner credentials","runner registration state","workspaces","Docker layers/volumes","GitHub tokens","PATs","repository secrets"]}' >"$work/payload/backup.json"
-  (cd "$work/payload" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS)
+  (
+    cd "$work/payload"
+    find . -type f ! -name SHA256SUMS -print0 \
+      | sort -z \
+      | xargs -0 sha256sum
+  ) >"$work/SHA256SUMS"
+  mv "$work/SHA256SUMS" "$work/payload/SHA256SUMS"
   tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -C "$work/payload" -cf - . | zstd -T0 -19 -o "$destination"
   chmod 600 "$destination"; rm -rf "$work"
   success "Created secret-free ${kind} migration backup: $destination"
@@ -128,8 +135,16 @@ scan_repo_command() {
   need_root
   local target="${1:-}" ref="${2:-}" slug repo_url
   [[ -n "$target" ]] || { list_projects_short; prompt target "Project slug or GitHub repository URL"; }
-  if [[ -r "$(project_file "$target")" ]]; then load_project "$target"; slug="$PROJECT_SLUG"; repo_url="$REPO_URL"; [[ -n "$ref" ]] || ref="$SCAN_REF"
-  else repo_url="$target"; slug="$(slug_from_repo_url "$repo_url")"; fi
+  if [[ -r "$(project_file "$target")" ]]; then
+    load_project "$target"
+    slug="$PROJECT_SLUG"
+    repo_url="$REPO_URL"
+    if [[ -z "$ref" ]]; then
+      ref="$SCAN_REF"
+    fi
+  else
+    repo_url="$target"
+    slug="$(slug_from_repo_url "$repo_url")"
+  fi
   scan_repository "$repo_url" "$slug" "$ref"
 }
-

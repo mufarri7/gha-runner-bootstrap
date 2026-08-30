@@ -1,6 +1,9 @@
+# shellcheck shell=bash
 self_update() {
   local release asset digest tmp target current
-  have jq && have curl || die "curl and jq are required."
+  if ! have jq || ! have curl; then
+    die "curl and jq are required."
+  fi
   release="$(curl -fsSL --retry 3 "https://api.github.com/repos/${GHRCTL_REPOSITORY}/releases?per_page=20")"
   asset="$(jq -r '[.[]|select(.draft==false)][0].assets[]?|select(.name=="ghrctl")|.browser_download_url' <<<"$release" | head -n1)"
   digest="$(jq -r '[.[]|select(.draft==false)][0].assets[]?|select(.name=="ghrctl")|(.digest//"")' <<<"$release" | head -n1)"
@@ -13,7 +16,7 @@ self_update() {
 
 interactive_menu() {
   need_root
-  local choice slug manifest out archive selector
+  local choice slug archive
   while true; do
     log; log "${BOLD}ghrctl v${GHRCTL_VERSION}${RESET} — GitHub self-hosted runner host manager (beta)"
     log "  1) Bootstrap a new CI server"
@@ -149,4 +152,3 @@ dispatch_command() {
     *) usage; die "Unknown command: $cmd" ;;
   esac
 }
-

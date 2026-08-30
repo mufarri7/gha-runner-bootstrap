@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 latest_runner_release() {
   local arch="$1" json version asset url digest
   json="$(curl -fsSL --retry 3 https://api.github.com/repos/actions/runner/releases/latest)" || die "Unable to query latest GitHub Actions runner release."
@@ -98,7 +99,9 @@ runner_name_from_dir() {
 
 runner_service_from_dir() {
   local dir="$1"
-  [[ -r "$dir/.service" ]] && cat "$dir/.service" || true
+  if [[ -r "$dir/.service" ]]; then
+    cat "$dir/.service"
+  fi
 }
 
 runner_is_busy() {
@@ -218,4 +221,3 @@ add_runner() {
   success "Runner ${name} is active."
   verify_runner_online_if_possible "$REPO_FULL_NAME" "$name"
 }
-

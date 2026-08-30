@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 list_projects_short() {
   need_root; init_dirs
   local files file
@@ -58,13 +59,20 @@ doctor() {
     uid="$(id -u "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"
     if [[ "$rootless" == "true" ]]; then
       if user_systemctl "$user" is-active docker >/dev/null 2>&1; then
-        (( JSON_OUTPUT == 0 )) && success "${slug}: rootless docker active"
+        if (( JSON_OUTPUT == 0 )); then
+          success "${slug}: rootless docker active"
+        fi
         runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" DOCKER_HOST="unix:///run/user/${uid}/docker.sock" docker info --format '  Docker {{.ServerVersion}} root={{.DockerRootDir}} security={{json .SecurityOptions}}' || ((failures+=1))
       else warn "${slug}: rootless docker inactive"; ((failures+=1)); fi
     fi
     while IFS= read -r dir; do
       service="$(runner_service_from_dir "$dir")"; state="$(systemctl is-active "$service" 2>/dev/null || true)"
-      [[ "$state" == "active" ]] && success "${slug}: $(runner_name_from_dir "$dir") active" || { warn "${slug}: $(runner_name_from_dir "$dir") ${state:-unknown}"; ((failures+=1)); }
+      if [[ "$state" == "active" ]]; then
+        success "${slug}: $(runner_name_from_dir "$dir") active"
+      else
+        warn "${slug}: $(runner_name_from_dir "$dir") ${state:-unknown}"
+        ((failures+=1))
+      fi
       systemctl show "$service" -p User -p Environment --no-pager | sed 's/^/  /' || true
     done < <(runner_dirs "$base")
   done
@@ -115,7 +123,9 @@ remove_runner() {
   confirm "Remove runner '$name' from GitHub and delete $dir?" "N" || die "Cancelled."
   begin_operation remove-runner "$(jq -cn --arg slug "$slug" --arg name "$name" '[$slug,$name]')"
   wait_runner_idle "$dir" 3600
-  [[ -n "$service" ]] && systemctl stop "$service" || true
+  if [[ -n "$service" ]]; then
+    systemctl stop "$service" || true
+  fi
   if [[ -x "$dir/svc.sh" && -r "$dir/.service" ]]; then (cd "$dir" && ./svc.sh uninstall) || true; fi
   if [[ -r "$dir/.runner" ]]; then
     token="$(get_remove_token "$REPO_FULL_NAME")"
@@ -175,4 +185,3 @@ repair_project() {
   done < <(runner_dirs "$BASE_DIR")
   doctor "$slug"
 }
-

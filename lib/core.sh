@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 set -Eeuo pipefail
 IFS=$'\n\t'
 
@@ -30,8 +31,6 @@ JSON_OUTPUT=0
 VERBOSE=0
 LOCK_HELD=0
 ACTIVE_OPERATION_FILE=""
-ACTIVE_OPERATION_NAME=""
-ACTIVE_OPERATION_ARGS_JSON='[]'
 
 if [[ -t 1 ]]; then
   BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; RESET=$'\033[0m'
@@ -44,7 +43,12 @@ info() { log "${BLUE}==>${RESET} $*"; json_log info info "$*"; }
 success() { log "${GREEN}OK${RESET}  $*"; json_log info success "$*"; }
 warn() { log "${YELLOW}WARN${RESET} $*" >&2; json_log warn warning "$*"; }
 die() { log "${RED}ERROR${RESET} $*" >&2; json_log error fatal "$*"; exit 1; }
-debug() { (( VERBOSE == 1 )) && log "${DIM}DEBUG${RESET} $*" >&2 || true; json_log debug debug "$*"; }
+debug() {
+  if (( VERBOSE == 1 )); then
+    log "${DIM}DEBUG${RESET} $*" >&2
+  fi
+  json_log debug debug "$*"
+}
 
 utc_now() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
@@ -86,7 +90,7 @@ on_exit() {
 trap on_exit EXIT
 
 have() { command -v "$1" >/dev/null 2>&1; }
-need_root() { [[ ${EUID} -eq 0 ]] || die "This operation must run as root. Use: sudo $0 $*"; }
+need_root() { [[ ${EUID} -eq 0 ]] || die "This operation must run as root. Re-run it with sudo."; }
 
 shell_quote_join() {
   local out="" part
@@ -167,8 +171,6 @@ begin_operation() {
   init_dirs
   id="$(date -u +'%Y%m%dT%H%M%SZ')-$$-${RANDOM}"
   ACTIVE_OPERATION_FILE="${OPERATIONS_DIR}/${id}.json"
-  ACTIVE_OPERATION_NAME="$name"
-  ACTIVE_OPERATION_ARGS_JSON="$args_json"
   jq -n \
     --arg id "$id" --arg name "$name" --arg status running \
     --arg started_at "$(utc_now)" --arg version "$GHRCTL_VERSION" \
@@ -204,4 +206,3 @@ resume_last_operation() {
   mapfile -t _resume_args < <(jq -r '.[]' <<<"$args")
   dispatch_command "$name" "${_resume_args[@]}"
 }
-

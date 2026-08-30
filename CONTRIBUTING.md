@@ -7,7 +7,7 @@
 ```bash
 bash -n ghrctl
 ./tests/test.sh
-shellcheck ghrctl tests/test.sh
+shellcheck -x ghrctl tests/test.sh
 ```
 
 ## Pull requests

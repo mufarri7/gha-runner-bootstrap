@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 static_scan_python() {
   cat <<'PYSCAN'
 import json, os, re, sys
@@ -161,7 +162,7 @@ filter_safe_apt_packages() {
 }
 
 install_project_node() {
-  local user="$1" requested="$2" home arch index version base filename url sums expected actual
+  local user="$1" requested="$2" home arch index version base filename url expected actual
   [[ -n "$requested" && "$requested" != "null" ]] || return 0
   requested="${requested#v}"; requested="${requested%%.*}"
   [[ "$requested" =~ ^[0-9]+$ ]] || { warn "Cannot resolve Node.js version: $requested"; return 0; }
@@ -314,4 +315,3 @@ apply_tool_profile() {
     fi
   fi
 }
-

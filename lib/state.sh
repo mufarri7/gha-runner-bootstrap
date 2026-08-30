@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 sanitize_slug() {
   local value="${1,,}"
   value="${value//_/-}"
@@ -86,7 +87,8 @@ save_project() {
 }
 
 update_project_timestamp() {
-  local file="$1" tmp="${file}.tmp"
+  local file="$1" tmp
+  tmp="${file}.tmp"
   jq --arg now "$(utc_now)" '.updated_at=$now' "$file" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file"
 }
 
@@ -129,4 +131,3 @@ migrate_legacy_state() {
   done
   shopt -u nullglob
 }
-

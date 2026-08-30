@@ -19,6 +19,6 @@ jobs:
       - name: Bash syntax
         run: bash -n ghrctl lib/*.sh tests/test.sh
       - name: ShellCheck
-        run: shellcheck ghrctl lib/*.sh tests/test.sh
+        run: shellcheck -x ghrctl tests/test.sh
       - name: Functional tests
         run: ./tests/test.sh
