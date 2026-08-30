@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq zstd
+      - name: Bash syntax
+        run: bash -n ghrctl lib/*.sh tests/test.sh
+      - name: ShellCheck
+        run: shellcheck ghrctl lib/*.sh tests/test.sh
+      - name: Functional tests
+        run: ./tests/test.sh
