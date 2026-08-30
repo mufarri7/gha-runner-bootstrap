@@ -53,15 +53,62 @@ assert_jq "$MANIFEST" '.projects[0].runner_count == 0'
 BACKUP="$TMP/fixture.tar.zst"
 create_backup_archive project fixture "$BACKUP" >/dev/null
 [[ -s "$BACKUP" ]] || fail "backup was not created"
-RESTORE_TMP="$TMP/validate"; mkdir -p "$RESTORE_TMP/extract"
+RESTORE_TMP="$TMP/validate"
+mkdir -p "$RESTORE_TMP/extract"
 validate_backup_archive "$BACKUP" "$RESTORE_TMP" >/dev/null
 assert_jq "$RESTORE_TMP/extract/backup.json" '.kind == "project" and .secret_free == true'
 if find "$RESTORE_TMP/extract" -type f \( -name '.runner' -o -name '.credentials*' \) | grep -q .; then
   fail "credential material found in backup"
 fi
 
-safe_archive_name 'payload/projects/test.json' || fail "safe archive name rejected"
-if safe_archive_name '../etc/passwd'; then fail "unsafe archive name accepted"; fi
+make_malicious_backup() {
+  local kind="$1" output="$2" tar_file="$TMP/${kind}.tar"
+  python3 - "$kind" "$tar_file" <<'PY'
+import io
+import json
+import sys
+import tarfile
 
-bash -n "$ROOT/ghrctl" "$ROOT"/lib/*.sh
+kind, output = sys.argv[1], sys.argv[2]
+with tarfile.open(output, "w") as tf:
+    metadata = json.dumps({"schema_version": 1, "kind": "project", "secret_free": True}).encode()
+    info = tarfile.TarInfo("backup.json")
+    info.size = len(metadata)
+    tf.addfile(info, io.BytesIO(metadata))
+
+    member = tarfile.TarInfo("projects/evil.json")
+    if kind == "symlink":
+        member.type = tarfile.SYMTYPE
+        member.linkname = "/etc/passwd"
+    elif kind == "hardlink":
+        member.type = tarfile.LNKTYPE
+        member.linkname = "../../etc/passwd"
+    elif kind == "traversal":
+        member.name = "../outside.json"
+        payload = b"{}"
+        member.size = len(payload)
+        tf.addfile(member, io.BytesIO(payload))
+        raise SystemExit
+    else:
+        raise ValueError(kind)
+    tf.addfile(member)
+PY
+  zstd -q -f "$tar_file" -o "$output"
+}
+
+for malicious_kind in symlink hardlink traversal; do
+  malicious="$TMP/${malicious_kind}.tar.zst"
+  make_malicious_backup "$malicious_kind" "$malicious"
+  malicious_work="$TMP/validate-${malicious_kind}"
+  mkdir -p "$malicious_work/extract"
+  if (validate_backup_archive "$malicious" "$malicious_work" >/dev/null 2>&1); then
+    fail "malicious ${malicious_kind} backup was accepted"
+  fi
+done
+
+safe_archive_name 'projects/test.json' || fail "safe archive name rejected"
+if safe_archive_name '../etc/passwd'; then fail "unsafe archive name accepted"; fi
+if safe_archive_name 'projects/../etc.json'; then fail "nested traversal path accepted"; fi
+
+bash -n "$ROOT/ghrctl" "$ROOT"/lib/*.sh "$ROOT/tests/test.sh"
 printf 'All tests passed.\n'
