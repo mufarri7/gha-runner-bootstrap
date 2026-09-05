@@ -43,6 +43,13 @@ trap cleanup_test_host EXIT
 
 jit_init_dirs
 jit_require_clean_host_runtime
+case "$GHRCTL_ROOT" in
+  /home/*|/root/*) ;;
+  *) printf 'This regression must execute the production backend from /home or /root.\n' >&2; exit 1 ;;
+esac
+staged_runtime_helper="$(jit_stage_runtime_helper)"
+[[ "$staged_runtime_helper" != "$GHRCTL_ROOT"/* && "$staged_runtime_helper" == "$JIT_RUNTIME_DIR"/* ]] || { printf 'JIT did not use the root-owned staged runtime path.\n' >&2; exit 1; }
+[[ "$(stat -c '%u:%a' "$staged_runtime_helper")" == 0:* ]] || { printf 'Staged JIT helper is not root-owned.\n' >&2; exit 1; }
 JIT_POLICY_REAL_ID_START=50000
 JIT_POLICY_REAL_ID_END=59999
 JIT_POLICY_SUBID_START=1000000000
@@ -74,6 +81,29 @@ if setpriv --reuid "$uid_two" --regid "$uid_two" --clear-groups unshare --user -
   printf 'Worker two mapped worker one real UID/GID.\n' >&2
   exit 1
 fi
+
+overlap_state_one="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-060)"
+jit_write_worker_state "$overlap_state_one" allocated
+jit_plan_worker_identity "$overlap_state_one" 60
+jit_create_worker_boundary "$overlap_state_one"
+overlap_root_one="$JIT_WORKER_ROOT"
+overlap_state_two="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-061)"
+jit_write_worker_state "$overlap_state_two" allocated
+jit_plan_worker_identity "$overlap_state_two" 61
+jit_create_worker_boundary "$overlap_state_two"
+overlap_root_two="$JIT_WORKER_ROOT"
+GHRCTL_JIT_TEST_LOCK_HOLD_SECONDS=1
+jit_cleanup_worker_state "$overlap_state_one" & cleanup_one=$!
+jit_cleanup_worker_state "$overlap_state_two" & cleanup_two=$!
+replacement_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-062)"
+jit_write_worker_state "$replacement_state" allocated
+jit_plan_worker_identity "$replacement_state" 62
+jit_create_worker_boundary "$replacement_state"
+wait "$cleanup_one" "$cleanup_two"
+jit_validate_host_id_maps "$replacement_state"
+jit_cleanup_worker_state "$replacement_state"
+unset GHRCTL_JIT_TEST_LOCK_HOLD_SECONDS
+[[ ! -e "$overlap_root_one" && ! -e "$overlap_root_two" ]] || { printf 'Concurrent cleanup left worker state behind.\n' >&2; exit 1; }
 
 jit_execute_runner "$state_one" jit-destructive-secret-one & execute_one=$!
 jit_execute_runner "$state_two" jit-destructive-secret-two & execute_two=$!

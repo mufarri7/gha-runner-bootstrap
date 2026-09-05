@@ -95,9 +95,22 @@ The foreground controller polls only jobs requesting the exact admission label. 
 
 ## Clean worker boundary
 
+### Root-owned runtime staging
+
+JIT launch stages `libexec/jit-worker-sandbox.sh` under
+`/usr/local/lib/ghrctl/jit-runtime` (or an explicitly configured equivalent
+outside `/home` and `/root`) before the transient unit starts. The staging
+directory and every path component must be canonical, root-owned, traversable,
+and not group/world-writable. The staged filename contains the controller revision and
+the helper SHA-256; a root-owned manifest records both that digest and the
+controller source digest. The controller re-hashes the staged helper immediately
+before `systemd-run`. A checkout under `/home` or `/root` is therefore only a
+source for the pre-launch copy; it is never visible to the `ProtectHome=yes`
+worker and is never the executable path passed to the unit.
+
 Before the first host mutation, the controller durably journals the deterministic worker user, group, UID/GID, exact subordinate UID/GID ranges, both configured pool snapshots, boundary paths, sandbox unit, and Docker socket. Creation checkpoints the boundary, group, user, subordinate IDs, runner seed, and sandbox preparation. The allocator parses every record in `/etc/passwd`, `/etc/group`, `/etc/subuid`, and `/etc/subgid`; malformed, overlapping, occupied, or cross-pool maps fail closed. Cleanup uses the journaled snapshot, so later policy drift cannot make a partially-created identity unrecognizable.
 
-The runner and its dedicated Rootless Docker daemon execute in one transient systemd boundary with private network, mount, `/tmp`, `/var/tmp`, `/dev/shm`, and IPC namespaces. `slirp4netns --disable-host-loopback` provides controlled egress without exposing the host loopback. The unit hides host homes and Docker sockets, restricts writable paths to the worker boundary, and is killed as one cgroup. Each slot therefore has distinct loopback services, temporary files, shared memory, IPC objects, home, daemon socket, and Docker data root. Workers use exactly:
+The runner and its dedicated Rootless Docker daemon execute in one transient systemd boundary with private network, mount, `/tmp`, `/var/tmp`, `/dev/shm`, and IPC namespaces. `slirp4netns --disable-host-loopback` provides controlled egress without exposing the host loopback. The unit hides host homes and Docker sockets, restricts writable paths to the worker boundary, and is killed as one cgroup. Each slot therefore has distinct loopback services, temporary files, shared memory, IPC objects, home, daemon socket, and Docker data root. Identity teardown (`usermod`, `userdel`, `groupdel`, subordinate-map removal) and its final map/mount validation take the same host-mutation lock as allocation, so a replacement cannot observe a half-removed worker. Workers use exactly:
 
 ```text
 /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

@@ -16,6 +16,83 @@ jit_test_backend_enabled() {
   [[ "${GHRCTL_TEST_MODE:-0}" == 1 && "${GHRCTL_JIT_HOST_BACKEND:-production}" == fake && "$JIT_DATA_DIR" == /tmp/* && "$JIT_BOUNDARY_ROOT" == /tmp/* ]]
 }
 
+jit_runtime_controller_digest() {
+  sha256sum "$GHRCTL_ROOT/ghrctl" "$GHRCTL_ROOT"/lib/*.sh | sha256sum | awk '{print $1}'
+}
+
+jit_runtime_controller_revision() {
+  local revision
+  if [[ "${GHRCTL_CONTROLLER_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s' "$GHRCTL_CONTROLLER_REVISION"
+    return 0
+  fi
+  if revision="$(git -C "$GHRCTL_ROOT" rev-parse --verify HEAD 2>/dev/null)" && [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s' "$revision"
+    return 0
+  fi
+  printf 'content-%s' "$(jit_runtime_controller_digest)"
+}
+
+jit_verify_root_owned_runtime_path() {
+  local path="$1" current=/ component owner mode
+  [[ "$path" == /* && "$path" != /home && "$path" != /home/* && "$path" != /root && "$path" != /root/* ]] || return 1
+  [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  IFS=/ read -r -a _jit_runtime_parts <<<"${path#/}"
+  for component in "${_jit_runtime_parts[@]}"; do
+    [[ -n "$component" ]] || continue
+    current="${current%/}/$component"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    owner="$(stat -c '%u' "$current")"; mode="$(stat -c '%a' "$current")"
+    [[ "$owner" == 0 ]] || return 1
+    (( (8#$mode & 022) == 0 )) || return 1
+    (( (8#$mode & 001) != 0 )) || return 1
+  done
+}
+
+jit_verify_staged_runtime_helper() {
+  local helper="$1" expected_hash="$2" owner mode actual
+  [[ -f "$helper" && ! -L "$helper" && -x "$helper" ]] || return 1
+  owner="$(stat -c '%u' "$helper")"; mode="$(stat -c '%a' "$helper")"
+  [[ "$owner" == 0 ]] || return 1
+  (( (8#$mode & 022) == 0 )) || return 1
+  actual="$(sha256sum "$helper" | awk '{print $1}')"
+  [[ "$actual" == "$expected_hash" ]]
+}
+
+jit_stage_runtime_helper() {
+  local source helper_hash controller_revision controller_digest runtime_dir staged manifest
+  source="${GHRCTL_ROOT}/libexec/jit-worker-sandbox.sh"
+  [[ -f "$source" && ! -L "$source" && -r "$source" ]] || die "The JIT sandbox helper source is unavailable or is a symlink."
+  helper_hash="$(sha256sum "$source" | awk '{print $1}')"
+  [[ "$helper_hash" =~ ^[0-9a-f]{64}$ ]] || die "The JIT sandbox helper hash is invalid."
+  controller_revision="$(jit_runtime_controller_revision)"
+  controller_digest="$(jit_runtime_controller_digest)"
+  runtime_dir="$JIT_RUNTIME_DIR"
+  if [[ "$runtime_dir" == /home || "$runtime_dir" == /home/* || "$runtime_dir" == /root || "$runtime_dir" == /root/* ]]; then
+    die "The JIT runtime staging directory must be outside protected home trees."
+  fi
+  # The service user must be able to traverse every component, while no
+  # component may be writable by that user or any other non-root principal.
+  durable_ensure_dir "$(dirname -- "$runtime_dir")" 755
+  durable_ensure_dir "$runtime_dir" 755
+  jit_verify_root_owned_runtime_path "$runtime_dir" || die "JIT runtime staging path is not root-owned, canonical, and non-writable."
+  staged="${runtime_dir}/jit-worker-sandbox-${controller_revision}-${helper_hash}.sh"
+  if [[ ! -e "$staged" ]]; then
+    durable_replace_file "$staged" 755 <"$source"
+  fi
+  jit_verify_staged_runtime_helper "$staged" "$helper_hash" || die "Staged JIT sandbox helper failed its hash or ownership check."
+  manifest="${runtime_dir}/manifest.json"
+  jq -n --arg revision "$controller_revision" --arg controller_digest "$controller_digest" \
+    --arg helper "$staged" --arg helper_sha256 "$helper_hash" --arg source_root "$GHRCTL_ROOT" \
+    --arg now "$(utc_now)" \
+    '{schema_version:1,controller_revision:$revision,controller_digest:$controller_digest,helper:$helper,helper_sha256:$helper_sha256,source_root:$source_root,staged_at:$now}' \
+    | durable_replace_file "$manifest" 644
+  [[ -f "$manifest" && ! -L "$manifest" && "$(stat -c '%u' "$manifest")" == 0 && "$(stat -c '%a' "$manifest")" == 644 ]] || die "JIT runtime manifest is not root-owned and mode 0644."
+  JIT_RUNTIME_HELPER="$staged"
+  JIT_RUNTIME_MANIFEST="$manifest"
+  printf '%s' "$staged"
+}
+
 jit_fault_inject() {
   local point="$1" requested="${GHRCTL_JIT_FAULT_POINT:-}"
   [[ -n "$requested" ]] || return 0
@@ -140,6 +217,20 @@ jit_validate_host_id_maps() {
     --sub-count "$(jq -r .subuid.count "$state_file")" --owner "$(jq -r .user "$state_file")"
 }
 
+jit_acquire_host_mutation_lock() {
+  local output_var="$1" fd
+  exec {fd}>>"${JIT_DATA_DIR}/host-mutation.lock"
+  flock -x "$fd"
+  printf -v "$output_var" '%s' "$fd"
+}
+
+jit_release_host_mutation_lock() {
+  local fd="$1"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+  flock -u "$fd"
+  eval "exec ${fd}>&-"
+}
+
 jit_checkpoint_worker_creation() {
   local state_file="$1" stage="$2" status="${3:-creating}"
   jq --arg stage "$stage" --arg status "$status" --arg now "$(utc_now)" '.creation_stage=$stage | .status=$status | .updated_at=$now' "$state_file" | jit_atomic_write "$state_file"
@@ -174,7 +265,7 @@ jit_load_worker_identity() {
 }
 
 jit_create_worker_boundary() {
-  local state_file="$1" user uid group worker_root home runner_dir docker_socket subuid_start subgid_start subid_count subuid_end subgid_end
+  local state_file="$1" user uid group worker_root home runner_dir docker_socket subuid_start subgid_start subid_count subuid_end subgid_end host_lock_fd
   jit_validate_worker_identity_state "$state_file" || die "Persisted JIT worker identity failed deterministic validation."
   jit_load_worker_identity "$state_file"
   user="$JIT_WORKER_USER"; uid="$JIT_WORKER_UID"; group="$JIT_WORKER_GROUP"; worker_root="$JIT_WORKER_ROOT"
@@ -215,8 +306,7 @@ jit_create_worker_boundary() {
     return 0
   fi
 
-  exec 8>"${JIT_DATA_DIR}/host-mutation.lock"
-  flock 8
+  jit_acquire_host_mutation_lock host_lock_fd
   jit_validate_host_id_maps "$state_file"
   id "$user" >/dev/null 2>&1 && die "JIT worker user already exists: $user"
   getent group "$group" >/dev/null 2>&1 && die "JIT worker group already exists: $group"
@@ -257,7 +347,7 @@ jit_create_worker_boundary() {
   mkdir -p "${worker_root}/runtime"; chown "$user:$group" "${worker_root}/runtime"; chmod 700 "${worker_root}/runtime"
   jit_fault_inject worker-after-sandbox-mutation
   jit_checkpoint_worker_creation "$state_file" sandbox-prepared
-  flock -u 8
+  jit_release_host_mutation_lock "$host_lock_fd"
   jit_checkpoint_worker_creation "$state_file" ready boundary-ready
 }
 
@@ -314,7 +404,7 @@ jit_write_worker_state() {
 }
 
 jit_execute_runner() {
-  local state_file="$1" config="$2" user group worker_root home runner_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log main_pid=0 slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt
+  local state_file="$1" config="$2" user group worker_root home runner_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper main_pid=0 slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt
   jit_load_worker_identity "$state_file"
   user="$JIT_WORKER_USER"; group="$JIT_WORKER_GROUP"; worker_root="$JIT_WORKER_ROOT"; home="$JIT_WORKER_HOME"
   runner_dir="$JIT_WORKER_RUNNER_DIR"; docker_socket="$JIT_WORKER_DOCKER_SOCKET"; unit="$JIT_WORKER_SANDBOX_UNIT"; network_unit="$JIT_WORKER_SANDBOX_NETWORK_UNIT"; network_ready="$JIT_WORKER_NETWORK_READY"
@@ -324,6 +414,7 @@ jit_execute_runner() {
     return
   fi
 
+  runtime_helper="$(jit_stage_runtime_helper)"
   diagnostic_dir="${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/$(jq -r .worker_id "$state_file")"
   controller_log="${diagnostic_dir}/controller.log"
   mkdir -p "$diagnostic_dir" "$(dirname "$network_ready")"
@@ -342,7 +433,7 @@ jit_execute_runner() {
     --property="InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/user" \
     --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" \
     --property=Delegate=yes --property=KillMode=control-group --property=UMask=0077 \
-    "${GHRCTL_ROOT}/libexec/jit-worker-sandbox.sh" "$home" "$runner_dir" "$(dirname "$docker_socket")" "$docker_socket" "$network_ready" \
+    "$runtime_helper" "$home" "$runner_dir" "$(dirname "$docker_socket")" "$docker_socket" "$network_ready" \
     2>&1 | python3 "${GHRCTL_ROOT}/libexec/bounded_log.py" "$controller_log" "$JIT_DIAGNOSTIC_MAX_FILE_BYTES" &
   systemd_pid=$!
   set -e
@@ -505,26 +596,49 @@ jit_quiesce_worker() {
 }
 
 jit_destroy_worker_boundary() {
-  local user="$1" uid="$2" group="$3" worker_root="$4" creation_stage="$5"
+  local user="$1" uid="$2" group="$3" worker_root="$4" creation_stage="$5" state_file="${6:-}" host_lock_fd subuid_start subgid_start subid_count subuid_end subgid_end cleanup_status=0
   [[ -n "$worker_root" && "$worker_root" != null ]] || return 0
   jit_assert_safe_worker_path "$worker_root"
-  if jit_test_backend_enabled; then
-    rm -rf --one-file-system "$worker_root"
-    return 0
-  fi
   [[ "$uid" =~ ^[1-9][0-9]*$ && "$user" =~ ^ghajit-[a-f0-9]{12}-[0-9]{3,}$ && "$group" == "$user" ]] || return 1
+  jit_acquire_host_mutation_lock host_lock_fd || return 1
+  if [[ "${GHRCTL_DESTRUCTIVE_TEST:-0}" == 1 && "${GHRCTL_JIT_TEST_LOCK_HOLD_SECONDS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    sleep "$GHRCTL_JIT_TEST_LOCK_HOLD_SECONDS"
+  fi
+  if jit_test_backend_enabled; then
+    rm -rf --one-file-system "$worker_root" || cleanup_status=1
+    jit_release_host_mutation_lock "$host_lock_fd" || cleanup_status=1
+    return "$cleanup_status"
+  fi
+  if [[ -n "$state_file" ]]; then
+    subuid_start="$(jq -r '.subuid.start // empty' "$state_file")"; subgid_start="$(jq -r '.subgid.start // empty' "$state_file")"; subid_count="$(jq -r '.subuid.count // empty' "$state_file")"
+    if [[ "$subuid_start" =~ ^[1-9][0-9]*$ && "$subgid_start" =~ ^[1-9][0-9]*$ && "$subid_count" =~ ^[1-9][0-9]*$ ]]; then
+      subuid_end=$((subuid_start + subid_count - 1)); subgid_end=$((subgid_start + subid_count - 1))
+    else
+      cleanup_status=1
+    fi
+  else
+    cleanup_status=1
+  fi
   if jit_stage_may_own_user "$creation_stage" && id "$user" >/dev/null 2>&1; then
-    if pgrep -u "$user" >/dev/null 2>&1; then return 1; fi
-    userdel --remove "$user" >/dev/null 2>&1 || return 1
+    if pgrep -u "$user" >/dev/null 2>&1; then
+      cleanup_status=1
+    else
+      usermod --del-subuids "${subuid_start}-${subuid_end}" "$user" >/dev/null 2>&1 || cleanup_status=1
+      usermod --del-subgids "${subgid_start}-${subgid_end}" "$user" >/dev/null 2>&1 || cleanup_status=1
+      userdel --remove "$user" >/dev/null 2>&1 || cleanup_status=1
+    fi
   fi
   if jit_stage_may_own_group "$creation_stage" && getent group "$group" >/dev/null 2>&1; then
-    groupdel "$group" >/dev/null 2>&1 || return 1
+    groupdel "$group" >/dev/null 2>&1 || cleanup_status=1
   fi
-  getent passwd "$user" >/dev/null 2>&1 && return 1
-  getent group "$group" >/dev/null 2>&1 && return 1
-  grep -qE "^${user}:" /etc/subuid /etc/subgid 2>/dev/null && return 1
-  if findmnt -rn -R "$worker_root" | grep -q .; then return 1; fi
-  rm -rf --one-file-system "$worker_root"
+  getent passwd "$user" >/dev/null 2>&1 && cleanup_status=1 || true
+  getent group "$group" >/dev/null 2>&1 && cleanup_status=1 || true
+  grep -qE "^${user}:" /etc/subuid /etc/subgid 2>/dev/null && cleanup_status=1 || true
+  if [[ -n "$state_file" ]] && ! (jit_validate_host_id_maps "$state_file" >/dev/null 2>&1); then cleanup_status=1; fi
+  if findmnt -rn -R "$worker_root" | grep -q .; then cleanup_status=1; fi
+  (( cleanup_status == 0 )) && rm -rf --one-file-system "$worker_root" || cleanup_status=1
+  jit_release_host_mutation_lock "$host_lock_fd" || cleanup_status=1
+  return "$cleanup_status"
 }
 
 jit_cleanup_worker_state() {
@@ -540,7 +654,7 @@ jit_cleanup_worker_state() {
   runner_id="$(jq -r '.runner_id // empty' "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; admission_id="$(jq -r .admission_id "$state_file")"
   jit_quiesce_worker "$state_file" || cleanup_failed=1
   (( cleanup_failed != 0 )) || jit_capture_worker_diagnostics "$admission_id" "$worker_id" "$worker_root" "$runner_dir" || cleanup_failed=1
-  jit_destroy_worker_boundary "$user" "$uid" "$group" "$worker_root" "$creation_stage" || cleanup_failed=1
+  jit_destroy_worker_boundary "$user" "$uid" "$group" "$worker_root" "$creation_stage" "$state_file" || cleanup_failed=1
   jit_deregister_runner "$runner_id" || cleanup_failed=1
   jit_reconcile_registration "$state_file" cleanup || cleanup_failed=1
   if (( cleanup_failed == 0 )); then
