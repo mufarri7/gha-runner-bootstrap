@@ -23,14 +23,18 @@ LOCK_FILE="${GHRCTL_LOCK_FILE:-/var/lock/ghrctl.lock}"
 BASE_ROOT="${GHRCTL_BASE_ROOT:-/srv/github-runners}"
 DEFAULT_SHARED_LABEL="shared-ci"
 GITHUB_API_VERSION="2026-03-10"
-JIT_SCHEMA_VERSION=1
+JIT_SCHEMA_VERSION=2
 JIT_SYSTEM_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 JIT_API_PAGE_SIZE=100
 JIT_API_MAX_PAGES=1000
+JIT_API_CONNECT_TIMEOUT_SECONDS=15
+JIT_API_REQUEST_TIMEOUT_SECONDS=60
+JIT_REGISTRATION_RECONCILE_SECONDS=30
 JIT_EVIDENCE_MAX_ARCHIVE_BYTES=65536
 JIT_EVIDENCE_MAX_JSON_BYTES=16384
-JIT_WORKER_UID_MIN=200000
-JIT_WORKER_UID_SPAN=200000
+JIT_DIAGNOSTIC_MAX_FILES=200
+JIT_DIAGNOSTIC_MAX_FILE_BYTES=4194304
+JIT_DIAGNOSTIC_MAX_TOTAL_BYTES=33554432
 JIT_POLICY_DIR="${STATE_DIR}/jit.d"
 JIT_DATA_DIR="${DATA_DIR}/jit"
 JIT_ADMISSIONS_DIR="${JIT_DATA_DIR}/admissions"
@@ -107,6 +111,16 @@ trap on_exit EXIT
 
 have() { command -v "$1" >/dev/null 2>&1; }
 need_root() { [[ ${EUID} -eq 0 ]] || die "This operation must run as root. Re-run it with sudo."; }
+
+durable_replace_file() {
+  local destination="$1" mode="${2:-600}"
+  python3 "${GHRCTL_ROOT}/libexec/durable_replace.py" --mode "$mode" "$destination"
+}
+
+durable_ensure_dir() {
+  local directory="$1" mode="${2:-700}"
+  python3 "${GHRCTL_ROOT}/libexec/durable_directory.py" --mode "$mode" "$directory"
+}
 
 shell_quote_join() {
   local out="" part
@@ -192,8 +206,7 @@ begin_operation() {
     --arg started_at "$(utc_now)" --arg version "$GHRCTL_VERSION" \
     --argjson args "$args_json" \
     '{schema_version:1,id:$id,name:$name,args:$args,status:$status,started_at:$started_at,updated_at:$started_at,ghrctl_version:$version,exit_code:null,note:null}' \
-    >"$ACTIVE_OPERATION_FILE"
-  chmod 600 "$ACTIVE_OPERATION_FILE"
+    | durable_replace_file "$ACTIVE_OPERATION_FILE"
   ln -sfn "$ACTIVE_OPERATION_FILE" "${OPERATIONS_DIR}/last.json"
   json_log info operation_started "Operation started: $name" "$(jq -cn --arg id "$id" --arg name "$name" '{operation_id:$id,operation:$name}')"
 }
@@ -201,12 +214,11 @@ begin_operation() {
 mark_operation() {
   local status="$1" exit_code="${2:-0}" note="${3:-}"
   [[ -n "$ACTIVE_OPERATION_FILE" && -f "$ACTIVE_OPERATION_FILE" ]] || return 0
-  local tmp="${ACTIVE_OPERATION_FILE}.tmp"
   jq \
     --arg status "$status" --arg updated_at "$(utc_now)" --arg note "$note" \
     --argjson exit_code "$exit_code" \
     '.status=$status | .updated_at=$updated_at | .exit_code=$exit_code | .note=(if $note=="" then null else $note end)' \
-    "$ACTIVE_OPERATION_FILE" >"$tmp" && mv "$tmp" "$ACTIVE_OPERATION_FILE"
+    "$ACTIVE_OPERATION_FILE" | durable_replace_file "$ACTIVE_OPERATION_FILE"
 }
 
 resume_last_operation() {

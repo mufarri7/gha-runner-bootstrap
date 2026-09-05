@@ -1,9 +1,14 @@
 # shellcheck shell=bash
 
 jit_init_dirs() {
-  mkdir -p "$JIT_POLICY_DIR" "$JIT_ADMISSIONS_DIR" "$JIT_WORKERS_DIR" "$JIT_RUNNER_CACHE_DIR" "$JIT_MIGRATIONS_DIR" "$JIT_DIAGNOSTICS_DIR" "$JIT_BOUNDARY_ROOT"
-  chmod 700 "$JIT_POLICY_DIR" "$JIT_DATA_DIR" "$JIT_ADMISSIONS_DIR" "$JIT_WORKERS_DIR" "$JIT_RUNNER_CACHE_DIR" "$JIT_MIGRATIONS_DIR" "$JIT_DIAGNOSTICS_DIR"
-  chmod 711 "$JIT_BOUNDARY_ROOT"
+  durable_ensure_dir "$JIT_DATA_DIR" 700
+  durable_ensure_dir "$JIT_POLICY_DIR" 700
+  durable_ensure_dir "$JIT_ADMISSIONS_DIR" 700
+  durable_ensure_dir "$JIT_WORKERS_DIR" 700
+  durable_ensure_dir "$JIT_RUNNER_CACHE_DIR" 700
+  durable_ensure_dir "$JIT_MIGRATIONS_DIR" 700
+  durable_ensure_dir "$JIT_DIAGNOSTICS_DIR" 700
+  durable_ensure_dir "$JIT_BOUNDARY_ROOT" 711
 }
 
 jit_policy_file() { printf '%s/%s.json' "$JIT_POLICY_DIR" "$1"; }
@@ -12,11 +17,8 @@ jit_worker_state_dir() { printf '%s/%s' "$JIT_WORKERS_DIR" "$1"; }
 jit_migration_file() { printf '%s/%s.json' "$JIT_MIGRATIONS_DIR" "$1"; }
 
 jit_atomic_write() {
-  local destination="$1" temporary
-  temporary="${destination}.tmp.$$.$RANDOM"
-  jq . >"$temporary"
-  chmod 600 "$temporary"
-  mv "$temporary" "$destination"
+  local destination="$1"
+  jq -e . | durable_replace_file "$destination"
 }
 
 jit_validate_sha() {
@@ -31,6 +33,7 @@ jit_validate_policy_json() {
   local file="$1" project repository workflow_path workflow_name admission_job evidence_prefix trusted_branch label_prefix actor forbidden_label
   [[ -r "$file" ]] || die "JIT policy is not readable: $file"
   jq -e --argjson schema "$JIT_SCHEMA_VERSION" '
+    . as $policy |
     .schema_version == $schema and
     (.project | type == "string" and length > 0) and
     (.repository | type == "string" and length > 2) and
@@ -48,6 +51,14 @@ jit_validate_policy_json() {
     (.poll_seconds | type == "number" and floor == . and . >= 1 and . <= 300) and
     (.max_runtime_seconds | type == "number" and floor == . and . >= 60 and . <= 86400) and
     (.rootless_docker == true) and
+    (.real_id_pool.start | type == "number" and floor == . and . >= 1) and
+    (.real_id_pool.end | type == "number" and floor == . and . >= $policy.real_id_pool.start and . <= 4294967294) and
+    (.subordinate_id_pool.start | type == "number" and floor == . and . >= 1) and
+    (.subordinate_id_pool.end | type == "number" and floor == . and . >= $policy.subordinate_id_pool.start and . <= 4294967294) and
+    (.subordinate_id_pool.range_size | type == "number" and floor == . and . >= 65536) and
+    ($policy.real_id_pool.end < $policy.subordinate_id_pool.start or $policy.subordinate_id_pool.end < $policy.real_id_pool.start) and
+    (($policy.real_id_pool.end - $policy.real_id_pool.start + 1) >= $policy.max_slots) and
+    (((($policy.subordinate_id_pool.end - $policy.subordinate_id_pool.start + 1) / $policy.subordinate_id_pool.range_size) | floor) >= $policy.max_slots) and
     (.forbidden_online_labels | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
     (.persistent_project | type == "string" and length > 0)
   ' "$file" >/dev/null || die "Invalid or unsafe JIT policy: $file"
@@ -108,6 +119,11 @@ jit_load_policy() {
   JIT_POLICY_FRESHNESS_SECONDS="$(jq -r .freshness_seconds "$file")"
   JIT_POLICY_POLL_SECONDS="$(jq -r .poll_seconds "$file")"
   JIT_POLICY_MAX_RUNTIME_SECONDS="$(jq -r .max_runtime_seconds "$file")"
+  JIT_POLICY_REAL_ID_START="$(jq -r .real_id_pool.start "$file")"
+  JIT_POLICY_REAL_ID_END="$(jq -r .real_id_pool.end "$file")"
+  JIT_POLICY_SUBID_START="$(jq -r .subordinate_id_pool.start "$file")"
+  JIT_POLICY_SUBID_END="$(jq -r .subordinate_id_pool.end "$file")"
+  JIT_POLICY_SUBID_COUNT="$(jq -r .subordinate_id_pool.range_size "$file")"
   JIT_POLICY_PERSISTENT_PROJECT="$(jq -r .persistent_project "$file")"
   jit_validate_policy_project_binding "$file"
 }
@@ -158,7 +174,7 @@ jit_curl_api_with_token() {
   grep -Eq '^[A-Za-z0-9_./?=&%:-]+$' <<<"$endpoint" && [[ "$endpoint" != *..* ]] || die "Unsafe GitHub API endpoint."
   url="https://api.github.com/${endpoint}"
   if [[ -n "$body" ]]; then
-    curl --silent --show-error --fail-with-body --request "$method" --url "$url" \
+    curl --silent --show-error --fail-with-body --connect-timeout "$JIT_API_CONNECT_TIMEOUT_SECONDS" --max-time "$JIT_API_REQUEST_TIMEOUT_SECONDS" --request "$method" --url "$url" \
       --header 'Accept: application/vnd.github+json' \
       --header "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
       --header 'Content-Type: application/json' \
@@ -166,7 +182,7 @@ jit_curl_api_with_token() {
 header = "Authorization: Bearer ${token}"
 EOF_CURL
   else
-    curl --silent --show-error --fail-with-body --request "$method" --url "$url" \
+    curl --silent --show-error --fail-with-body --connect-timeout "$JIT_API_CONNECT_TIMEOUT_SECONDS" --max-time "$JIT_API_REQUEST_TIMEOUT_SECONDS" --request "$method" --url "$url" \
       --header 'Accept: application/vnd.github+json' \
       --header "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" \
       --config - <<EOF_CURL
@@ -361,15 +377,13 @@ jit_load_admission() {
 }
 
 jit_set_admission_status() {
-  local status="$1" note="${2:-}" temporary
-  temporary="${JIT_ADMISSION_FILE}.tmp.$$.$RANDOM"
+  local status="$1" note="${2:-}"
   jq --arg status "$status" --arg note "$note" --arg now "$(utc_now)" '
     .status=$status |
     .note=(if $note=="" then null else $note end) |
     (if $status=="running" and .consumed_at==null then .consumed_at=$now else . end) |
     (if ($status=="completed" or $status=="failed" or $status=="cancelled" or $status=="cleaned") then .completed_at=$now else . end)
-  ' "$JIT_ADMISSION_FILE" >"$temporary"
-  chmod 600 "$temporary"; mv "$temporary" "$JIT_ADMISSION_FILE"
+  ' "$JIT_ADMISSION_FILE" | jit_atomic_write "$JIT_ADMISSION_FILE"
 }
 
 jit_get_run_jobs() {

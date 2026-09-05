@@ -73,23 +73,19 @@ jit_local_persistent_inventory() {
 }
 
 jit_migration_checkpoint_service() {
-  local record="$1" service="$2" step="$3" status="$4" temporary
-  temporary="${record}.tmp.$$.$RANDOM"
+  local record="$1" service="$2" step="$3" status="$4"
   jq --arg service "$service" --arg step "$step" --arg status "$status" --arg now "$(utc_now)" '
     (.persistent_services[] | select(.service==$service) | .[$step])=$status |
     .current_action={service:$service,step:$step,status:$status} | .updated_at=$now
-  ' "$record" >"$temporary"
-  chmod 600 "$temporary"; mv "$temporary" "$record"
+  ' "$record" | jit_atomic_write "$record"
 }
 
 jit_migration_checkpoint_remote() {
-  local record="$1" status="$2" runners="${3:-null}" forbidden="${4:-null}" temporary
-  temporary="${record}.tmp.$$.$RANDOM"
+  local record="$1" status="$2" runners="${3:-null}" forbidden="${4:-null}"
   jq --arg status "$status" --arg now "$(utc_now)" --argjson runners "$runners" --argjson forbidden "$forbidden" '
     .remote_verification={status:$status,checked_at:(if $status=="checking" then null else $now end),runners:$runners,forbidden_online:$forbidden} |
     .current_action={service:null,step:"remote-verification",status:$status} | .updated_at=$now
-  ' "$record" >"$temporary"
-  chmod 600 "$temporary"; mv "$temporary" "$record"
+  ' "$record" | jit_atomic_write "$record"
 }
 
 jit_initialize_migration_journal() {
@@ -223,8 +219,8 @@ jit_assert_persistent_quarantined() {
   record="$(jit_migration_file "$JIT_POLICY_PROJECT")"
   [[ -r "$record" ]] || die "No reviewed persistent-runner quarantine record exists."
   jit_validate_migration_journal "$record" "$JIT_POLICY_PROJECT"
-  jq -e --arg project "$JIT_POLICY_PROJECT" --arg repository "$JIT_POLICY_REPOSITORY" '
-    .schema_version==1 and .project==$project and .repository==$repository and .status=="quarantined" and .automatic_resume==false and
+  jq -e --argjson schema "$JIT_SCHEMA_VERSION" --arg project "$JIT_POLICY_PROJECT" --arg repository "$JIT_POLICY_REPOSITORY" '
+    .schema_version==$schema and .project==$project and .repository==$repository and .status=="quarantined" and .automatic_resume==false and
     .remote_verification.status=="passed" and all(.persistent_services[]; .drain=="completed" and .stop=="completed" and .disable=="completed")
   ' "$record" >/dev/null || die "Persistent-runner quarantine journal is incomplete or inactive."
   inventory="$(jq -c .persistent_services "$record")"
@@ -241,7 +237,7 @@ jit_rollback_project() {
   need_root
   acquire_lock
   jit_init_dirs
-  local project="${1:-}" auth=gh record admission_file admission_project failures=0 temporary
+  local project="${1:-}" auth=gh record admission_file admission_project failures=0
   [[ -n "$project" ]] || die "JIT policy project is required."
   shift || true
   while (($#)); do case "$1" in --auth) auth="${2:-}"; shift 2 ;; *) die "Unknown rollback option: $1" ;; esac; done
@@ -260,9 +256,7 @@ jit_rollback_project() {
   done
   shopt -u nullglob
   (( failures == 0 )) || die "Rollback cleanup is incomplete; persistent runners remain quarantined."
-  temporary="${record}.tmp.$$.$RANDOM"
-  jq --arg now "$(utc_now)" '.status="rolled-back" | .rolled_back_at=$now | .automatic_resume=false' "$record" >"$temporary"
-  chmod 600 "$temporary"; mv "$temporary" "$record"
+  jq --arg now "$(utc_now)" '.status="rolled-back" | .rolled_back_at=$now | .automatic_resume=false' "$record" | jit_atomic_write "$record"
   unset JIT_API_TOKEN
   if (( JSON_OUTPUT == 1 )); then
     jq '. + {persistent_runners_resumed:false,next_step:"owner review, then explicit ghrctl resume-project if broad-label access is intended"}' "$record"

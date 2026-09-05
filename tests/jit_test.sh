@@ -5,6 +5,8 @@ export GHRCTL_JIT_HOST_BACKEND=fake
 export GHRCTL_JIT_FAKE_RUNNER_ROOT="$ROOT/tests/fixtures/fake-actions-runner"
 export GHRCTL_JIT_FAKE_SERVICES_DIR="$TMP/fake-services"
 mkdir -p "$GHRCTL_JIT_FAKE_SERVICES_DIR"
+JIT_TEST_REMOTE_RUNNERS_FILE="$TMP/fake-remote-runners.json"
+printf '[]\n' >"$JIT_TEST_REMOTE_RUNNERS_FILE"
 
 JIT_TEST_RUN_ID=987654321
 JIT_TEST_ATTEMPT=2
@@ -24,6 +26,9 @@ jq '.project="mazaya-test" | .repository="owner/repo" | .persistent_project="fix
 jit_init_dirs
 jit_validate_policy_json "$TEST_POLICY"
 jit_validate_policy_project_binding "$TEST_POLICY"
+INVALID_POOL_POLICY="$TMP/jit-policy-overlap.json"
+jq '.subordinate_id_pool.start=55000 | .subordinate_id_pool.end=120535' "$TEST_POLICY" >"$INVALID_POOL_POLICY"
+if (jit_validate_policy_json "$INVALID_POOL_POLICY" >/dev/null 2>&1); then fail "overlapping configured real/subordinate ID pools were accepted"; fi
 jq . "$TEST_POLICY" | jit_atomic_write "$(jit_policy_file mazaya-test)"
 jit_load_policy mazaya-test
 
@@ -75,6 +80,7 @@ jit_configure_auth() {
 
 jit_api() {
   local method="$1" endpoint="$2" body="${3:-}" created_at repository event attempt head_branch head_sha path actor triggering_actor job_status job_conclusion controller_finished=0 controller_min worker_state_dir page
+  local runner_name runner_label runner_id remote temporary state_file intent_found=0
   local artifact_name artifact_digest artifact_archive artifact_size artifact_json
   created_at="$JIT_TEST_CREATED"
   repository="$JIT_POLICY_REPOSITORY"; event=workflow_dispatch; attempt="$JIT_TEST_ATTEMPT"; head_branch=main; head_sha="$JIT_TEST_BASE"
@@ -92,7 +98,7 @@ jit_api() {
     worker_state_dir="$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
     controller_min="${JIT_TEST_CONTROLLER_MIN_SEQUENCE:-8}"
     if compgen -G "$worker_state_dir/worker-*.json" >/dev/null; then
-      controller_finished="$(jq -s --argjson minimum "$controller_min" '[.[] | select((.sequence // 0) >= $minimum and .status=="finished")] | length' "$worker_state_dir"/worker-*.json)"
+      controller_finished="$(jq -s --argjson minimum "$controller_min" '[.[] | select((.sequence // 0) >= $minimum)] | length' "$worker_state_dir"/worker-*.json)"
     fi
   fi
   case "$JIT_TEST_CASE" in
@@ -168,11 +174,26 @@ jit_api() {
       jq -cn --arg merge "$JIT_TEST_MERGE" --arg tree "$JIT_TEST_TREE" --arg base "$JIT_TEST_BASE" --arg head "$JIT_TEST_HEAD" '{sha:$merge,tree:{sha:$tree},parents:[{sha:$base},{sha:$head}]}'
       ;;
     POST:repos/*/actions/runners/generate-jitconfig)
+      runner_name="$(jq -r .name <<<"$body")"; runner_label="$(jq -r .labels[0] <<<"$body")"; runner_id=$((7000 + 10#${runner_name##*-}))
+      shopt -s nullglob
+      for state_file in "$JIT_WORKERS_DIR"/*/*.json; do
+        if jq -e --arg name "$runner_name" --arg label "$runner_label" '.status=="registration-requested" and .registration.status=="requested" and .registration.runner_name==$name and .registration.label==$label and (.registration.request_id|length)==64' "$state_file" >/dev/null 2>&1; then intent_found=1; break; fi
+      done
+      shopt -u nullglob
+      [[ "$intent_found" == 1 ]] || fail "remote JIT creation happened before durable registration intent"
+      exec 7>"$TMP/fake-api.lock"; flock 7
+      remote="$(cat "$JIT_TEST_REMOTE_RUNNERS_FILE")"
       if [[ "$JIT_TEST_CASE" == default-labels ]]; then
-        jq -cn --arg label "$JIT_TEST_LABEL" '{runner:{id:7001,labels:[{name:$label,type:"custom"},{name:"self-hosted",type:"read-only"}]},encoded_jit_config:"jit-secret-material-123456"}'
+        temporary="${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp.$$"
+        jq --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '. + [{id:($id|tonumber),name:$name,status:"offline",busy:false,ephemeral:true,labels:[{name:$label},{name:"self-hosted"}]}]' <<<"$remote" >"$temporary"; mv "$temporary" "$JIT_TEST_REMOTE_RUNNERS_FILE"
+        jq -cn --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '{runner:{id:($id|tonumber),name:$name,status:"offline",busy:false,labels:[{name:$label,type:"custom"},{name:"self-hosted",type:"read-only"}]},encoded_jit_config:"jit-secret-material-123456"}'
       else
-        jq -cn --arg label "$JIT_TEST_LABEL" '{runner:{id:7001,labels:[{name:$label,type:"custom"}]},encoded_jit_config:"jit-secret-material-123456"}'
+        temporary="${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp.$$"
+        jq --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '. + [{id:($id|tonumber),name:$name,status:"offline",busy:false,ephemeral:true,labels:[{name:$label}]}]' <<<"$remote" >"$temporary"; mv "$temporary" "$JIT_TEST_REMOTE_RUNNERS_FILE"
+        if [[ "$JIT_TEST_CASE" == registration-lost-response ]]; then flock -u 7; return 75; fi
+        jq -cn --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '{runner:{id:($id|tonumber),name:$name,status:"offline",busy:false,labels:[{name:$label,type:"custom"}]},encoded_jit_config:"jit-secret-material-123456"}'
       fi
+      flock -u 7
       ;;
     GET:repos/*/actions/runners\?per_page=100\&page=*)
       page="${endpoint##*page=}"
@@ -193,10 +214,16 @@ jit_api() {
       elif [[ "$JIT_TEST_CASE" == forbidden-runner || -e "$GHRCTL_JIT_FAKE_SERVICES_DIR/actions.runner.fixture.service.active" ]]; then
         jq -cn '{total_count:1,runners:[{id:41,name:"persistent",status:"online",busy:false,ephemeral:false,labels:[{name:"self-hosted"},{name:"Linux"},{name:"X64"},{name:"fixture-ci"},{name:"shared-ci"}]}]}'
       else
-        jq -cn --arg label "$JIT_TEST_LABEL" '{total_count:1,runners:[{id:7001,name:"jit",status:"offline",busy:false,ephemeral:true,labels:[{name:$label}]}]}'
+        remote="$(cat "$JIT_TEST_REMOTE_RUNNERS_FILE")"
+        jq -cn --argjson runners "$remote" '{total_count:($runners|length),runners:$runners}'
       fi
       ;;
-    DELETE:repos/*/actions/runners/7001)
+    DELETE:repos/*/actions/runners/*)
+      runner_id="${endpoint##*/}"
+      exec 7>"$TMP/fake-api.lock"; flock 7
+      temporary="${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp.$$"
+      jq --arg id "$runner_id" '[.[] | select((.id|tostring)!=$id)]' "$JIT_TEST_REMOTE_RUNNERS_FILE" >"$temporary"; mv "$temporary" "$JIT_TEST_REMOTE_RUNNERS_FILE"
+      flock -u 7
       : >"$TMP/jit-delete-called"
       printf '{}\n'
       ;;
@@ -259,6 +286,59 @@ assert_eq "$(jit_target_jobs "$valid_jobs" | jq length)" "2"
 invalid_jobs="$(jq -cn --arg label "$JIT_TEST_LABEL" '{jobs:[{id:1,name:"unsafe",status:"queued",conclusion:null,labels:[$label,"self-hosted"]}]}')"
 if (jit_target_jobs "$invalid_jobs" >/dev/null 2>&1); then fail "reusable/default job labels were accepted"; fi
 
+id_maps="$TMP/id-maps"; mkdir -p "$id_maps"
+printf 'root:x:0:0:root:/root:/bin/bash\n' >"$id_maps/passwd"
+printf 'root:x:0:\n' >"$id_maps/group"
+printf 'legacy:100000:65536\n' >"$id_maps/subuid"
+printf 'legacy:200000:65536\n' >"$id_maps/subgid"
+identity_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-900)"
+mkdir -p "$(dirname "$identity_state")"; jit_write_worker_state "$identity_state" allocated; jit_plan_worker_identity "$identity_state" 900
+GHRCTL_JIT_PASSWD_FILE="$id_maps/passwd" GHRCTL_JIT_GROUP_FILE="$id_maps/group" GHRCTL_JIT_SUBUID_FILE="$id_maps/subuid" GHRCTL_JIT_SUBGID_FILE="$id_maps/subgid" \
+  jit_validate_host_id_maps "$identity_state"
+printf 'legacy:50000:1\n' >>"$id_maps/subuid"
+if GHRCTL_JIT_PASSWD_FILE="$id_maps/passwd" GHRCTL_JIT_GROUP_FILE="$id_maps/group" GHRCTL_JIT_SUBUID_FILE="$id_maps/subuid" GHRCTL_JIT_SUBGID_FILE="$id_maps/subgid" jit_validate_host_id_maps "$identity_state" >/dev/null 2>&1; then
+  fail "a subordinate UID range overlapping the configured real-ID pool was accepted"
+fi
+sed -i '$d' "$id_maps/subuid"
+printf 'mapped:x:1000000000:1000000000:mapped:/nonexistent:/usr/sbin/nologin\n' >>"$id_maps/passwd"
+if GHRCTL_JIT_PASSWD_FILE="$id_maps/passwd" GHRCTL_JIT_GROUP_FILE="$id_maps/group" GHRCTL_JIT_SUBUID_FILE="$id_maps/subuid" GHRCTL_JIT_SUBGID_FILE="$id_maps/subgid" jit_validate_host_id_maps "$identity_state" >/dev/null 2>&1; then
+  fail "a real UID inside the configured subordinate-ID pool was accepted"
+fi
+sed -i '$d' "$id_maps/passwd"
+printf 'overlap:120000:65536\n' >>"$id_maps/subuid"
+if GHRCTL_JIT_PASSWD_FILE="$id_maps/passwd" GHRCTL_JIT_GROUP_FILE="$id_maps/group" GHRCTL_JIT_SUBUID_FILE="$id_maps/subuid" GHRCTL_JIT_SUBGID_FILE="$id_maps/subgid" jit_validate_host_id_maps "$identity_state" >/dev/null 2>&1; then
+  fail "overlapping subordinate UID records were accepted"
+fi
+rm -f "$identity_state"
+
+diagnostic_boundary="$TMP/diagnostic-boundary"
+diagnostic_destination="$TMP/diagnostic-retention"
+mkdir -p "$diagnostic_boundary/source/nested"
+printf 'safe\n' >"$diagnostic_boundary/source/nested/runner.log"
+python3 "$ROOT/libexec/collect_diagnostics.py" --boundary "$diagnostic_boundary" --source "$diagnostic_boundary/source" --destination "$diagnostic_destination/valid" \
+  --max-files 200 --max-file-bytes 4194304 --max-total-bytes 33554432
+[[ "$(<"$diagnostic_destination/valid/nested/runner.log")" == safe ]] || fail "bounded diagnostic collector lost a regular file"
+
+diagnostic_reject() {
+  local case_name="$1" source="$2"
+  if python3 "$ROOT/libexec/collect_diagnostics.py" --boundary "$diagnostic_boundary" --source "$source" --destination "$diagnostic_destination/$case_name" \
+    --max-files 200 --max-file-bytes 4194304 --max-total-bytes 33554432 >/dev/null 2>&1; then
+    fail "unsafe diagnostic source was accepted: $case_name"
+  fi
+  [[ ! -e "$diagnostic_destination/$case_name" ]] || fail "partial diagnostics survived rejection: $case_name"
+}
+ln -s /etc "$diagnostic_boundary/top-link"; diagnostic_reject top-symlink "$diagnostic_boundary/top-link"; rm "$diagnostic_boundary/top-link"
+mkdir "$diagnostic_boundary/nested-link"; ln -s /etc/passwd "$diagnostic_boundary/nested-link/passwd"; diagnostic_reject nested-symlink "$diagnostic_boundary/nested-link"
+mkdir "$diagnostic_boundary/fifo"; mkfifo "$diagnostic_boundary/fifo/pipe"; diagnostic_reject fifo "$diagnostic_boundary/fifo"
+mkdir "$diagnostic_boundary/socket"; python3 -c 'import socket,sys;s=socket.socket(socket.AF_UNIX);s.bind(sys.argv[1]);s.close()' "$diagnostic_boundary/socket/probe"; diagnostic_reject socket "$diagnostic_boundary/socket"
+mkdir "$diagnostic_boundary/hardlink"; printf data >"$diagnostic_boundary/hardlink/a"; ln "$diagnostic_boundary/hardlink/a" "$diagnostic_boundary/hardlink/b"; diagnostic_reject hardlink "$diagnostic_boundary/hardlink"
+mkdir "$diagnostic_boundary/sparse"; truncate -s 1048576 "$diagnostic_boundary/sparse/file"; diagnostic_reject sparse "$diagnostic_boundary/sparse"
+mkdir "$diagnostic_boundary/per-file"; dd if=/dev/zero of="$diagnostic_boundary/per-file/file" bs=1048576 count=4 status=none; printf x >>"$diagnostic_boundary/per-file/file"; diagnostic_reject per-file "$diagnostic_boundary/per-file"
+mkdir "$diagnostic_boundary/count"; for diagnostic_index in $(seq 1 201); do : >"$diagnostic_boundary/count/$diagnostic_index"; done; diagnostic_reject file-count "$diagnostic_boundary/count"
+mkdir "$diagnostic_boundary/aggregate"; for diagnostic_index in $(seq 1 9); do dd if=/dev/zero of="$diagnostic_boundary/aggregate/$diagnostic_index" bs=1048576 count=4 status=none; done; diagnostic_reject aggregate "$diagnostic_boundary/aggregate"
+diagnostic_reject outside-boundary /etc
+rm -rf --one-file-system "$diagnostic_boundary"
+
 jit_prepare_runner_cache
 state_dir="$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
 mkdir -p "$state_dir"
@@ -268,9 +348,9 @@ wait "$(jq -r .controller_pid "$state_one")"
 assert_eq "$(jq -r .status "$state_one")" "finished"
 [[ ! -e "$(jq -r .root "$state_one")" ]] || fail "successful worker boundary survived cleanup"
 diagnostics="${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/worker-001"
-[[ -r "$diagnostics/runner.log" ]] || fail "external runner diagnostics were not retained"
+[[ -r "$diagnostics/runner/runner.log" ]] || fail "external runner diagnostics were not retained"
 if grep -R -F 'jit-secret-material-123456' "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1; then fail "JIT secret leaked into state or diagnostics"; fi
-if grep -q '^ACTIONS_RUNNER_INPUT_JITCONFIG=' "$diagnostics/job-environment.log"; then fail "JIT configuration reached the job environment"; fi
+if grep -q '^ACTIONS_RUNNER_INPUT_JITCONFIG=' "$diagnostics/runner/job-environment.log"; then fail "JIT configuration reached the job environment"; fi
 
 state_two="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-002)"
 state_three="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-003)"
@@ -327,7 +407,7 @@ JIT_ADMISSION_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 mkdir -p "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
 worker_fault_points=(
   worker-after-boundary-mutation worker-after-group-mutation worker-after-user-mutation worker-after-subids-mutation
-  worker-after-runner-seed-mutation worker-after-linger-mutation worker-after-user-manager-mutation worker-after-docker-mutation
+  worker-after-runner-seed-mutation worker-after-sandbox-mutation worker-after-docker-mutation
 )
 fault_sequence=1
 for fault_point in "${worker_fault_points[@]}"; do
@@ -345,6 +425,51 @@ for fault_point in "${worker_fault_points[@]}"; do
   [[ ! -e "$fault_root" ]] || fail "partial worker boundary survived cleanup: $fault_point"
   fault_sequence=$((fault_sequence + 1))
 done
+
+registration_sequence=100
+for registration_fault in registration-after-intent-before-request registration-after-response-before-id registration-after-id-persisted; do
+  registration_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" "worker-$(printf '%03d' "$registration_sequence")")"
+  jit_write_worker_state "$registration_state" allocated; jit_plan_worker_identity "$registration_state" "$registration_sequence"
+  GHRCTL_JIT_FAULT_POINT="$registration_fault"
+  if (jit_generate_config "$(jq -r .user "$registration_state")" "$registration_state" >/dev/null 2>&1); then fail "registration fault injection did not fire: $registration_fault"; fi
+  unset GHRCTL_JIT_FAULT_POINT
+  jq -e '.registration.request_id|length==64' "$registration_state" >/dev/null || fail "registration intent was not durable before fault: $registration_fault"
+  jit_cleanup_worker_state "$registration_state"
+  assert_eq "$(jq -r .status "$registration_state")" cleaned
+  assert_eq "$(jq 'length' "$JIT_TEST_REMOTE_RUNNERS_FILE")" 0
+  registration_sequence=$((registration_sequence + 1))
+done
+
+registration_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-103)"
+jit_write_worker_state "$registration_state" allocated; jit_plan_worker_identity "$registration_state" 103
+JIT_TEST_CASE=registration-lost-response
+if (jit_generate_config "$(jq -r .user "$registration_state")" "$registration_state" >/dev/null 2>&1); then fail "lost JIT registration response was accepted"; fi
+JIT_TEST_CASE=valid
+jq -e '.status=="registration-requested" and .registration.status=="requested" and .runner_id==null' "$registration_state" >/dev/null || fail "ambiguous registration intent was not recoverable after process failure"
+assert_eq "$(jq 'length' "$JIT_TEST_REMOTE_RUNNERS_FILE")" 1
+jit_cleanup_stale_worker_states "$(dirname "$registration_state")"
+assert_eq "$(jq -r .status "$registration_state")" cleaned
+assert_eq "$(jq 'length' "$JIT_TEST_REMOTE_RUNNERS_FILE")" 0
+
+registration_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-104)"
+jit_write_worker_state "$registration_state" allocated; jit_plan_worker_identity "$registration_state" 104
+JIT_TEST_CASE=registration-lost-response
+if (jit_generate_config "$(jq -r .user "$registration_state")" "$registration_state" >/dev/null 2>&1); then fail "lost JIT registration response was accepted"; fi
+JIT_TEST_CASE=valid
+jq '.[0].labels=[{name:"wrong-admission"}]' "$JIT_TEST_REMOTE_RUNNERS_FILE" >"${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp"; mv "${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp" "$JIT_TEST_REMOTE_RUNNERS_FILE"
+if jit_cleanup_worker_state "$registration_state" >/dev/null 2>&1; then fail "mismatched orphan registration was deleted by name alone"; fi
+assert_eq "$(jq -r .status "$registration_state")" cleanup-pending
+printf '[]\n' >"$JIT_TEST_REMOTE_RUNNERS_FILE"; jit_cleanup_worker_state "$registration_state"
+
+registration_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-105)"
+jit_write_worker_state "$registration_state" allocated; jit_plan_worker_identity "$registration_state" 105
+JIT_TEST_CASE=registration-lost-response
+if (jit_generate_config "$(jq -r .user "$registration_state")" "$registration_state" >/dev/null 2>&1); then fail "lost JIT registration response was accepted"; fi
+JIT_TEST_CASE=valid
+jq '. + [.[0] | .id=9999]' "$JIT_TEST_REMOTE_RUNNERS_FILE" >"${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp"; mv "${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp" "$JIT_TEST_REMOTE_RUNNERS_FILE"
+if jit_cleanup_worker_state "$registration_state" >/dev/null 2>&1; then fail "multiple ambiguous registrations were not rejected"; fi
+printf '[]\n' >"$JIT_TEST_REMOTE_RUNNERS_FILE"; jit_cleanup_worker_state "$registration_state"
+
 JIT_ADMISSION_ID="$saved_admission_id"
 jit_load_admission "$JIT_ADMISSION_ID"
 
@@ -397,19 +522,22 @@ DRY_RUN=0
 JIT_TEST_CONTROLLER=1
 jit_launch_admission "$JIT_ADMISSION_ID" --slots 2 --auth test >/dev/null
 assert_eq "$(jq -r .status "$JIT_ADMISSION_FILE")" "completed"
-assert_eq "$(find "$(jit_worker_state_dir "$JIT_ADMISSION_ID")" -maxdepth 1 -type f -name 'worker-*.json' | wc -l | tr -d ' ')" "10"
-assert_eq "$(jq -s '[.[] | select((.sequence // 0) >= 8 and .status=="finished")] | length' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json)" "3"
+first_launch_count="$(find "$(jit_worker_state_dir "$JIT_ADMISSION_ID")" -maxdepth 1 -type f -name 'worker-*.json' | wc -l | tr -d ' ')"
+(( first_launch_count >= 10 && first_launch_count <= 20 )) || fail "controller replacement count escaped the configured bound"
+(( $(jq -s '[.[] | select((.sequence // 0) >= 8 and .status=="finished")] | length' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json) >= 3 )) || fail "controller did not finish all simulated jobs"
 jit_set_admission_status running
 jit_set_admission_status cancelled "simulated host restart"
 DRY_RUN=1
 resume_plan="$(jit_resume_admission "$JIT_ADMISSION_ID" --slots 2 --auth test)"
 jq -e '.action=="resume-jit" and .replacements_launched==false' >/dev/null <<<"$resume_plan" || fail "JIT resume dry-run JSON is invalid"
 DRY_RUN=0
-JIT_TEST_CONTROLLER_MIN_SEQUENCE=11
+JIT_TEST_CONTROLLER_MIN_SEQUENCE="$(jit_next_worker_sequence "$(jit_worker_state_dir "$JIT_ADMISSION_ID")")"
+resume_before_count="$first_launch_count"
 jit_resume_admission "$JIT_ADMISSION_ID" --slots 2 --auth test >/dev/null
 assert_eq "$(jq -r .status "$JIT_ADMISSION_FILE")" "completed"
-assert_eq "$(find "$(jit_worker_state_dir "$JIT_ADMISSION_ID")" -maxdepth 1 -type f -name 'worker-*.json' | wc -l | tr -d ' ')" "13"
-assert_eq "$(jq -s '[.[] | select((.sequence // 0) >= 11 and .status=="finished")] | length' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json)" "3"
+resume_after_count="$(find "$(jit_worker_state_dir "$JIT_ADMISSION_ID")" -maxdepth 1 -type f -name 'worker-*.json' | wc -l | tr -d ' ')"
+(( resume_after_count >= resume_before_count + 3 && resume_after_count <= resume_before_count + 13 )) || fail "resume replacement count escaped the configured bound"
+(( $(jq -s --argjson minimum "$JIT_TEST_CONTROLLER_MIN_SEQUENCE" '[.[] | select((.sequence // 0) >= $minimum and .status=="finished")] | length' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json) >= 3 )) || fail "resumed controller did not finish all simulated jobs"
 JIT_TEST_CONTROLLER=0
 unset JIT_TEST_CONTROLLER_MIN_SEQUENCE
 

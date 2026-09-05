@@ -35,6 +35,11 @@ Do not open a public issue containing credentials, exploit details, or a host-co
 - Fully paginate runner, workflow-job, and admission-artifact inventories against stable totals or fail closed.
 - Give each JIT job a fresh user, home, runner copy, process identity, and Rootless Docker daemon; destroy all mutable state after that one job.
 - Persist deterministic worker identity before the first host mutation, and checkpoint every partial creation stage for restart-safe cleanup.
+- Keep configured real UID/GID pools disjoint from every subordinate UID/GID range, and verify the complete host maps under the mutation lock.
+- Place every JIT runner and its Rootless Docker daemon in one private network, mount, temporary-file, shared-memory, and IPC boundary.
+- Stop and verify worker processes before collecting diagnostics; accept only canonical in-boundary regular files under strict retention limits.
+- Journal JIT registration intent before the remote request and reconcile unknown outcomes only by deterministic name plus exact admission label.
+- Durably create every critical JIT journal directory with no-follow traversal and ordered child/parent directory fsync, then replace state with file fsync, atomic rename, and parent-directory fsync.
 - Never pass controller credentials or encoded JIT configuration to candidate arguments, state, logs, homes, workspaces, or job environments.
 - Derive reusable labels from the bound persistent project state using case-insensitive comparison.
 - Journal persistent-runner quarantine before mutation and resume its per-service checkpoints idempotently; rollback must not resume services automatically.

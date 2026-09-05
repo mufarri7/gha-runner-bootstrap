@@ -66,7 +66,7 @@ case "$MODE" in
     mkdir -p "$GHRCTL_BASE_ROOT/live-evidence"
     policy_file="$TEST_ROOT/live-policy.json"
     jq -n --arg repository "$GITHUB_REPOSITORY" --arg workflow_path "$workflow_path" --arg workflow_name "$GITHUB_WORKFLOW" --arg job_name "$GITHUB_JOB" --arg branch "$run_branch" --arg artifact_prefix "$artifact_prefix" \
-      '{schema_version:1,project:"live-evidence",repository:$repository,workflow_path:$workflow_path,workflow_name:$workflow_name,admission_job_name:$job_name,evidence_artifact_prefix:$artifact_prefix,trusted_branch:$branch,allowed_actors:["github-actions"],label_prefix:"ghrctl-live-",runner_group_id:1,max_slots:1,max_replacements:0,freshness_seconds:3600,poll_seconds:1,max_runtime_seconds:60,rootless_docker:true,forbidden_online_labels:["self-hosted"],persistent_project:"live-evidence"}' \
+      '{schema_version:2,project:"live-evidence",repository:$repository,workflow_path:$workflow_path,workflow_name:$workflow_name,admission_job_name:$job_name,evidence_artifact_prefix:$artifact_prefix,trusted_branch:$branch,allowed_actors:["github-actions"],label_prefix:"ghrctl-live-",runner_group_id:1,max_slots:1,max_replacements:0,freshness_seconds:3600,poll_seconds:1,max_runtime_seconds:60,rootless_docker:true,real_id_pool:{start:50000,end:59999},subordinate_id_pool:{start:1000000000,end:1067108863,range_size:65536},forbidden_online_labels:["self-hosted"],persistent_project:"live-evidence"}' \
       >"$policy_file"
     jit_init_dirs
     jq . "$policy_file" | jit_atomic_write "$(jit_policy_file live-evidence)"

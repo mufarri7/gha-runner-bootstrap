@@ -74,22 +74,20 @@ validate_project_json() {
 
 save_project() {
   local slug="$1" repo_url="$2" repo_full="$3" runner_user="$4" base_dir="$5" labels_csv="$6" rootless="$7" scan_ref="${8:-}"
-  local file tmp
-  file="$(project_file "$slug")"; tmp="${file}.tmp"
+  local file
+  file="$(project_file "$slug")"
   jq -n \
     --argjson schema_version "$STATE_SCHEMA_VERSION" \
     --arg slug "$slug" --arg repo_url "$repo_url" --arg repo_full_name "$repo_full" \
     --arg runner_user "$runner_user" --arg base_dir "$base_dir" --arg labels "$labels_csv" \
     --argjson rootless "$rootless" --arg scan_ref "$scan_ref" --arg now "$(utc_now)" \
     '{schema_version:$schema_version,slug:$slug,target_type:"repository",repo_url:$repo_url,repo_full_name:$repo_full_name,runner_user:$runner_user,base_dir:$base_dir,labels:($labels|split(",")|map(select(length>0))|unique),rootless_docker:$rootless,scan_ref:(if $scan_ref=="" then null else $scan_ref end),created_at:$now,updated_at:$now}' \
-    >"$tmp"
-  chmod 600 "$tmp"; mv "$tmp" "$file"
+    | durable_replace_file "$file"
 }
 
 update_project_timestamp() {
-  local file="$1" tmp
-  tmp="${file}.tmp"
-  jq --arg now "$(utc_now)" '.updated_at=$now' "$file" >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file"
+  local file="$1"
+  jq --arg now "$(utc_now)" '.updated_at=$now' "$file" | durable_replace_file "$file"
 }
 
 load_project() {

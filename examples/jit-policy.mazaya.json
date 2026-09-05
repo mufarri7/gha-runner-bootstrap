@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "project": "mazaya-backend",
   "repository": "mufarri7/mazaya_backend",
   "workflow_path": ".github/workflows/trusted-self-hosted-data-plane.yml",
@@ -18,6 +18,15 @@
   "poll_seconds": 10,
   "max_runtime_seconds": 21600,
   "rootless_docker": true,
+  "real_id_pool": {
+    "start": 50000,
+    "end": 59999
+  },
+  "subordinate_id_pool": {
+    "start": 1000000000,
+    "end": 1067108863,
+    "range_size": 65536
+  },
   "forbidden_online_labels": [
     "self-hosted",
     "linux",

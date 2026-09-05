@@ -18,7 +18,7 @@ Run:
 sudo ./tests/jit_ubuntu_24_04.sh
 ```
 
-Record users, UIDs, homes, runner directories, process probes, Rootless Docker socket/data-root paths, and cleanup results for two simultaneous boundaries. The test must prove cross-user file and process-environment denial, distinct Docker sockets/data roots, removal of both accounts, and removal of all worker paths.
+Record users, UIDs/GIDs, complete subordinate maps, homes, transient units and namespaces, runner directories, process probes, Rootless Docker socket/data-root paths, and cleanup results for two simultaneous boundaries. The test must attempt to map one worker's real UID/GID through the other worker's namespace and prove denial. It must also prove cross-slot denial for localhost services, `/tmp`, `/var/tmp`, `/dev/shm`, SysV/POSIX IPC, homes, Docker sockets, and state after UID reuse.
 
 ## End-to-end private canary
 
@@ -30,9 +30,10 @@ Record users, UIDs, homes, runner directories, process probes, Rootless Docker s
 6. Verify each runner accepts only one job, exits, is deregistered, and has its mutable boundary destroyed.
 7. Verify a replacement worker is created for the third queued job and is unable to observe markers from either prior job.
 8. Repeat with job success, failure, cancellation, controller `SIGTERM`, and a VM restart during a job. Run `jit resume` after restart and verify stale cleanup precedes any replacement.
-9. Verify runner and controller diagnostics remain in root-owned external storage after every worker directory is gone and contain no credential/JIT configuration.
+9. Verify runner and bounded controller diagnostics remain in root-owned external storage after every worker directory is gone and contain no credential/JIT configuration. Exercise top-level/nested symlinks and rename races to `/root` and `/etc`, FIFO/socket/device/hardlink/sparse inputs, file-count/per-file/aggregate caps, and destination disk exhaustion; every unsafe collection must fail closed without partial retention.
 10. Attempt stale run, replay, wrong repository/workflow/attempt/actor/SHA/label, failed/skipped admission, default labels, active broad-label persistent runner, rootful Docker socket, writable PATH, replacement exhaustion, and cleanup mount failures. Every case must fail closed.
-11. Inject a failure after every boundary/group/user/subid/runner-copy/linger/user-manager/Docker mutation but before its completion checkpoint, and prove deterministic cleanup from the persisted worker journal.
+11. Inject a failure after every boundary/group/user/subid/runner-copy/sandbox/Docker mutation and at every registration-intent/remote-create/ID-persistence boundary, then prove deterministic cleanup and exact remote reconciliation from the persisted worker journal.
+12. Abruptly restart the disposable VM immediately before and after durable worker and migration checkpoints. Credit recovery only after the file fsync, atomic rename, and parent-directory fsync completed; verify no replacement starts before stale cleanup and registration reconciliation.
 
 ## Migration and rollback rehearsal
 

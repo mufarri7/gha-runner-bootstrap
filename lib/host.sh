@@ -1,7 +1,7 @@
 install_base_packages() {
   info "Installing host packages (idempotent)..."
   if (( DRY_RUN == 1 )); then
-    log "DRY-RUN apt-get install: ca-certificates curl wget git jq unzip zip tar gzip xz-utils zstd rsync build-essential gnupg lsb-release acl htop tmux tree ufw fail2ban sysstat uidmap dbus-user-session slirp4netns fuse-overlayfs iptables xvfb xauth python3 python3-venv"
+    log "DRY-RUN apt-get install: ca-certificates curl wget git jq unzip zip tar gzip xz-utils zstd rsync build-essential gnupg lsb-release acl htop tmux tree ufw fail2ban sysstat uidmap dbus-user-session slirp4netns fuse-overlayfs iproute2 iptables xvfb xauth python3 python3-venv"
     return 0
   fi
   export DEBIAN_FRONTEND=noninteractive
@@ -9,7 +9,7 @@ install_base_packages() {
   apt-get install -y \
     ca-certificates curl wget git jq unzip zip tar gzip xz-utils zstd rsync \
     build-essential gnupg lsb-release acl htop tmux tree ufw fail2ban sysstat \
-    uidmap dbus-user-session slirp4netns fuse-overlayfs iptables xvfb xauth \
+    uidmap dbus-user-session slirp4netns fuse-overlayfs iproute2 iptables xvfb xauth \
     python3 python3-venv
   apt-get install -y gh >/dev/null 2>&1 || warn "GitHub CLI (gh) was not available from the OS repository; paste/PAT modes still work."
   systemctl enable --now fail2ban >/dev/null 2>&1 || true

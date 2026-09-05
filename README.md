@@ -42,9 +42,10 @@ Runners for the **same repository/trust boundary** may share that repository's r
 - Server reconstruction with fresh runner registration credentials.
 - Optional GitHub API verification that a newly registered runner is online.
 - Owner-controlled, replay-resistant JIT admission verification through a run-attempt/job-bound immutable artifact and exact merge identity.
-- Bounded one-job workers with a fresh Linux user, home, runner copy, Rootless Docker daemon, and destructive trusted cleanup per job.
+- Bounded one-job workers with verified disjoint identity pools and a fresh private network/mount/tmp/IPC, Linux user, home, runner copy, Rootless Docker daemon, and destructive trusted cleanup per job.
 - Complete fail-closed GitHub collection pagination and project-state-derived reusable-label rejection.
 - Write-ahead persistent-runner quarantine, resumable checkpoints, explicit recovery, and rollback that never silently restores broad-label access.
+- Durable JIT journals, pre-request registration intent, exact remote orphan reconciliation, and process-first bounded diagnostic retention.
 
 ## Quick start
 

@@ -9,8 +9,9 @@ trusted-main workflow_dispatch
   -> successful GitHub-hosted admission job
   -> immutable run-attempt/job-bound JSON artifact + PR + ordered merge-parent verification
   -> root-only replay-resistant admission state
+  -> durable registration intent + exact-name/label reconciliation
   -> one GitHub JIT configuration per worker
-  -> one fresh Linux user/home/runner copy/Rootless Docker daemon
+  -> one fresh Linux user and private network/mount/tmp/IPC/Rootless Docker boundary
   -> at most one job
   -> root-owned diagnostics
   -> remote deregistration + process/user/home/runtime destruction
@@ -30,6 +31,7 @@ Start from [`examples/jit-policy.mazaya.json`](../examples/jit-policy.mazaya.jso
 - `label_prefix`: the final label is exactly `<prefix><run-id>-<run-attempt>`.
 - `max_slots`: maximum simultaneous workers.
 - `max_replacements`: finite retry budget beyond the number of labelled jobs.
+- `real_id_pool` and `subordinate_id_pool`: explicitly reserved, non-overlapping real UID/GID and subordinate-ID intervals. The complete host passwd/group/subuid/subgid maps are revalidated under the host-mutation lock before and after allocation.
 - `freshness_seconds` and `max_runtime_seconds`: replay and controller time bounds.
 - `forbidden_online_labels`: additional broad labels that must not remain online before launch; comparison is case-insensitive.
 - `persistent_project`: required existing `ghrctl` project whose repository and labels are validated against the policy. Its real labels are automatically added to the forbidden set.
@@ -93,15 +95,19 @@ The foreground controller polls only jobs requesting the exact admission label. 
 
 ## Clean worker boundary
 
-Before the first host mutation, the controller journals the deterministic worker user, group, UID/GID, boundary, home, runner directory, and Docker socket. Creation checkpoints the boundary, group, user, subordinate IDs, runner seed, linger, user manager, and Docker startup. Cleanup therefore has enough trusted state after a failure or host restart to remove every partially created resource. Each worker receives a new locked Linux account and group, subordinate UID/GID ranges, mode-0700 home, private runner installation copy, private runtime directory, and dedicated Rootless Docker daemon/socket/data root. Workers use exactly:
+Before the first host mutation, the controller durably journals the deterministic worker user, group, UID/GID, exact subordinate UID/GID ranges, both configured pool snapshots, boundary paths, sandbox unit, and Docker socket. Creation checkpoints the boundary, group, user, subordinate IDs, runner seed, and sandbox preparation. The allocator parses every record in `/etc/passwd`, `/etc/group`, `/etc/subuid`, and `/etc/subgid`; malformed, overlapping, occupied, or cross-pool maps fail closed. Cleanup uses the journaled snapshot, so later policy drift cannot make a partially-created identity unrecognizable.
+
+The runner and its dedicated Rootless Docker daemon execute in one transient systemd boundary with private network, mount, `/tmp`, `/var/tmp`, `/dev/shm`, and IPC namespaces. `slirp4netns --disable-host-loopback` provides controlled egress without exposing the host loopback. The unit hides host homes and Docker sockets, restricts writable paths to the worker boundary, and is killed as one cgroup. Each slot therefore has distinct loopback services, temporary files, shared memory, IPC objects, home, daemon socket, and Docker data root. Workers use exactly:
 
 ```text
 /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ```
 
-PATH entries must resolve to root-owned, non-group/world-writable directories. Rootful Docker services and `/var/run/docker.sock` are forbidden. Different slot users cannot traverse each other's homes, read process environments, mutate runner installations, or access Docker sockets.
+PATH entries must resolve to root-owned, non-group/world-writable directories. Rootful Docker services and `/var/run/docker.sock` are forbidden.
 
-On every exit path, diagnostics are copied to `/var/log/ghrctl/jit/<admission>/<worker>` before processes are terminated, linger and the user manager are disabled, the user and subordinate IDs are removed, mounts are checked, the home/boundary is deleted, and the runner ID is deleted remotely if GitHub has not already removed the JIT runner.
+Controller and unit output is drained directly into a root-created file capped at 4 MiB. On every exit path, the sandbox unit, Rootless Docker daemon, network helper, and all worker-UID processes are terminated and verified absent before `_diag` is inspected. The collector opens the canonical in-boundary source with no-follow file descriptors; it rejects top-level or nested symlinks, mount crossings, special files, hard links, sparse files, and concurrent metadata changes. It retains at most 200 regular files, 4 MiB per file, and 32 MiB aggregate, using a fresh root-only destination. Collection failure is fail-closed and leaves cleanup pending rather than copying an unsafe tree as root.
+
+Before `generate-jitconfig`, the worker journal records `registration-requested` with deterministic runner name, exact admission label, admission ID, and request identity. After a timeout, process death, or reboot, cleanup scans the complete paginated runner inventory by exact name. One non-busy runner with exactly the admission label is deleted as an orphan; zero is accepted after bounded stable observation; duplicate, mismatched, or busy results fail closed. The create response must report the expected offline/non-busy identity with one custom label; one-job ephemerality comes from GitHub's JIT-config endpoint contract. The local boundary is then deleted and the recorded runner ID is deregistered if present.
 
 ## Persistent-runner migration
 
@@ -124,7 +130,7 @@ sudo ./ghrctl --dry-run --json jit resume ADMISSION_ID --slots 2
 sudo ./ghrctl jit resume ADMISSION_ID --slots 2
 ```
 
-Resume validates PID identity using both boot ID and process start time, avoids killing a reused PID, destroys stale boundaries, revalidates the same current admission, and continues only within policy time and replacement bounds. If evidence is stale or cleanup cannot be proven, run explicit cleanup and dispatch a new trusted workflow attempt:
+Resume validates PID identity using both boot ID and process start time, avoids killing a reused PID, reconciles ambiguous remote registration, destroys stale boundaries, revalidates the same current admission, and continues only within policy time and replacement bounds. Before the first journal file or host mutation, critical JIT directory creation traverses without following symlinks and fsyncs each new child and its parent in order. Policy, admission, worker, and migration checkpoint replacement then fsyncs the new file, atomically renames it, and fsyncs the parent directory. The abrupt-restart recovery guarantee begins only after the relevant directory and file helpers return successfully on a local filesystem that honors file and directory `fsync`; there is no claim of transactional atomicity across multiple journal files or on filesystems that reject those operations. If evidence is stale or cleanup cannot be proven, run explicit cleanup and dispatch a new trusted workflow attempt:
 
 ```bash
 sudo ./ghrctl jit cleanup ADMISSION_ID

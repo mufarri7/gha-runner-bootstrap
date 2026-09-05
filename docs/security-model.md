@@ -29,6 +29,11 @@
 - write-ahead, resumable persistent-runner quarantine and non-automatic rollback;
 - complete fail-closed pagination for runner, workflow-job, and artifact inventories;
 - deterministic pre-mutation worker identity journals and partial-creation cleanup.
+- verified disjoint real/subordinate ID pools against complete host maps;
+- private network, mount, temporary-file, shared-memory, and IPC namespaces per JIT worker;
+- pre-request JIT registration intent and exact-name/exact-label orphan reconciliation;
+- process-first quiescence and no-follow, regular-only, strictly bounded diagnostics;
+- file- and parent-directory-fsynced critical JIT state replacement.
 
 ## Residual risks
 
