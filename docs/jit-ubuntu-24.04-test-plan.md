@@ -18,7 +18,7 @@ Run:
 sudo ./tests/jit_ubuntu_24_04.sh
 ```
 
-Record users, UIDs/GIDs, complete subordinate maps, homes, transient units and namespaces, runner directories, process probes, Rootless Docker socket/data-root paths, and cleanup results for two simultaneous boundaries. The test must attempt to map one worker's real UID/GID through the other worker's namespace and prove denial. It must also prove cross-slot denial for localhost services, `/tmp`, `/var/tmp`, `/dev/shm`, SysV/POSIX IPC, homes, Docker sockets, and state after UID reuse.
+Run this test with the repository checkout physically under `/home` or `/root`. Before launch, it must stage the helper under the root-owned external runtime path, verify its controller-revision/helper-SHA manifest, and then prove the production backend can execute that staged helper while `ProtectHome=yes` hides the checkout. Record users, UIDs/GIDs, complete subordinate maps, homes, transient units and namespaces, runner directories, process probes, Rootless Docker socket/data-root paths, and cleanup results for two simultaneous boundaries. The test must attempt to map one worker's real UID/GID through the other worker's namespace and prove denial. It must also prove cross-slot denial for localhost services, `/tmp`, `/var/tmp`, `/dev/shm`, SysV/POSIX IPC, homes, Docker sockets, and state after UID reuse, plus two concurrent cleanups racing a replacement allocation under the host-mutation lock.
 
 ## End-to-end private canary
 

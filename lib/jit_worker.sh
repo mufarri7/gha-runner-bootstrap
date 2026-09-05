@@ -22,21 +22,23 @@ jit_runtime_controller_digest() {
 
 jit_runtime_controller_revision() {
   local revision
-  if [[ "${GHRCTL_CONTROLLER_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
-    printf '%s' "$GHRCTL_CONTROLLER_REVISION"
-    return 0
-  fi
   if revision="$(git -C "$GHRCTL_ROOT" rev-parse --verify HEAD 2>/dev/null)" && [[ "$revision" =~ ^[0-9a-f]{40}$ ]]; then
     printf '%s' "$revision"
+    return 0
+  fi
+  if [[ "${GHRCTL_CONTROLLER_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s' "$GHRCTL_CONTROLLER_REVISION"
     return 0
   fi
   printf 'content-%s' "$(jit_runtime_controller_digest)"
 }
 
 jit_verify_root_owned_runtime_path() {
-  local path="$1" current=/ component owner mode
+  local path="$1" canonical current=/ component owner mode
   [[ "$path" == /* && "$path" != /home && "$path" != /home/* && "$path" != /root && "$path" != /root/* ]] || return 1
   [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+  canonical="$(readlink -m -- "$path")" || return 1
+  [[ "$canonical" == "$path" ]] || return 1
   IFS=/ read -r -a _jit_runtime_parts <<<"${path#/}"
   for component in "${_jit_runtime_parts[@]}"; do
     [[ -n "$component" ]] || continue
