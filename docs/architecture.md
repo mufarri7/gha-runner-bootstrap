@@ -26,6 +26,12 @@ Different projects use different users and therefore different:
 - process ownership;
 - runner workspaces.
 
+## Admission-driven JIT boundary
+
+JIT workers do not reuse the persistent project user or Docker daemon. The controller paginates GitHub collections to stable declared totals, verifies a digest-protected run-attempt/job-bound admission artifact, and persists deterministic worker identity before the first host mutation. It checkpoints boundary, group, user, subordinate-ID, runner-copy, linger, user-manager, and Rootless Docker creation so every partial state can be cleaned after interruption. A bounded controller replaces exited workers while exact-label jobs remain queued.
+
+JIT policy, admission, worker, and migration records are root-only JSON. Persistent-runner migration uses a write-ahead `preparing` journal with per-service drain/stop/disable and remote-verification checkpoints. These records contain identities and lifecycle state but never API credentials or encoded JIT configurations. See [Admission-driven clean JIT runners](jit-runner.md).
+
 ## State
 
 ```text

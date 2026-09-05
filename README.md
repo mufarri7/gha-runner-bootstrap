@@ -1,6 +1,6 @@
 # ghrctl
 
-**`ghrctl` is a public beta host manager for persistent Linux GitHub Actions self-hosted runners.**
+**`ghrctl` is a public beta host manager for persistent and admission-driven clean one-job Linux GitHub Actions self-hosted runners.**
 
 It bootstraps a new CI VPS, creates an isolated trust boundary per repository, registers one or more runners, statically inspects repositories for host prerequisites, manages rootless Docker, and produces secret-free migration backups for one project or the whole managed CI host.
 
@@ -41,6 +41,10 @@ Runners for the **same repository/trust boundary** may share that repository's r
 - Secret-free project and managed-host migration backups.
 - Server reconstruction with fresh runner registration credentials.
 - Optional GitHub API verification that a newly registered runner is online.
+- Owner-controlled, replay-resistant JIT admission verification through a run-attempt/job-bound immutable artifact and exact merge identity.
+- Bounded one-job workers with a fresh Linux user, home, runner copy, Rootless Docker daemon, and destructive trusted cleanup per job.
+- Complete fail-closed GitHub collection pagination and project-state-derived reusable-label rejection.
+- Write-ahead persistent-runner quarantine, resumable checkpoints, explicit recovery, and rollback that never silently restores broad-label access.
 
 ## Quick start
 
@@ -180,6 +184,15 @@ export-manifest [slug]
 restore-manifest FILE
 adopt [base-directory]
 resume
+jit install-policy FILE
+jit prepare <project> --run-id ID --run-attempt N --pr-number N --base-sha SHA --head-sha SHA --merge-sha SHA --tree-sha SHA --label LABEL
+jit launch <admission-id> [--slots N]
+jit status <admission-id>
+jit cleanup <admission-id>
+jit resume <admission-id> [--slots N]
+jit migration-plan <project>
+jit quarantine-persistent <project> [--timeout SECONDS]
+jit rollback <project>
 swap-policy
 self-update
 ```
@@ -206,6 +219,14 @@ A runner can be registered using one of three methods:
 
 Tokens are read interactively and are never stored in project state, logs, manifests, or backups.
 
+## Admission-driven clean JIT mode
+
+JIT mode is disabled by default and has no automatically enabled service. A root/operator must install a reviewed policy, retrieve and validate the exact trusted run-attempt admission artifact, complete journaled persistent-runner quarantine, and explicitly launch that admission. UI job summaries and logs are never admission authority, and candidate workflows never receive runner-management authority.
+
+Each JIT runner receives only its unique admission label and at most one job. Every worker identity and path is persisted before the first host mutation, then creation is checkpointed through user, subordinate-ID, runner-copy, and Docker stages. Diagnostics move to root-owned external storage before the complete worker boundary is destroyed. Slot capacity and replacements are bounded.
+
+See [Admission-driven clean JIT runners](docs/jit-runner.md) and the mandatory pre-stable [Ubuntu 24.04 destructive validation plan](docs/jit-ubuntu-24.04-test-plan.md).
+
 ## Security model
 
 - Runner users are rejected if they belong to `sudo`, `wheel`, or `docker`.
@@ -224,7 +245,7 @@ See [Security model](docs/security-model.md) and [SECURITY.md](SECURITY.md).
 
 - Ubuntu and Debian with systemd and `apt`.
 - GitHub.com repository-level runners.
-- Persistent runners; organization/enterprise groups and clean JIT/ephemeral workers remain roadmap items.
+- Repository-level JIT is beta and intentionally operator-driven; organization/enterprise runner groups remain roadmap items.
 - Repository scanning is heuristic. Review every generated tool plan before applying it.
 - Host backups rebuild ghrctl-managed CI state; they do not clone the entire operating system.
 - Docker cache backup is excluded because layers can be large and may contain sensitive build material.
@@ -235,10 +256,10 @@ See [Security model](docs/security-model.md) and [SECURITY.md](SECURITY.md).
 
 ```bash
 bash -n ghrctl
-sudo ./tests/test.sh
+./tests/test.sh
 ```
 
-The functional suite redirects all managed state into temporary directories while exercising the root-gated public entry points. The repository CI also runs ShellCheck.
+The functional suite redirects all managed state into temporary directories, injects a test-only root gate, and uses a fake JIT host/API boundary. Production commands remain root-gated. The repository CI also runs ShellCheck. The destructive Ubuntu 24.04 test is separately guarded and must never run on an existing runner host.
 
 ## License
 

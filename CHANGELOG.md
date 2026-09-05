@@ -8,6 +8,16 @@ The project follows semantic versioning after `1.0.0`. Pre-1.0 beta versions may
 
 - No stable release has been published.
 
+### Added
+
+- Admission-driven JIT policy, trusted workflow/run/PR/merge verification, freshness checks, and replay-resistant state.
+- Bounded clean one-job workers with unique labels, per-job Linux users and Rootless Docker daemons, external diagnostics, deregistration, and destructive cleanup.
+- Persistent-runner migration planning, drain/quarantine, interrupted-operation resume, and rollback without automatic broad-label reactivation.
+- Immutable run-attempt/job-bound admission artifacts with SHA-256 and safe-archive validation; UI summaries and logs are not trusted evidence.
+- Complete fail-closed pagination, write-ahead resumable quarantine journals, and deterministic pre-mutation worker identity checkpoints.
+- Corrected `mazaya-backend` policy with case-insensitive project-derived reusable-label quarantine.
+- Fake lifecycle/security tests plus a guarded Ubuntu 24.04 destructive test and pre-stable validation plan.
+
 ## [0.2.0-beta.1] - 2026-08-30
 
 ### Added

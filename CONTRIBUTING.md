@@ -6,11 +6,11 @@
 
 ```bash
 bash -n ghrctl
-sudo ./tests/test.sh
-shellcheck -x ghrctl tests/test.sh
+./tests/test.sh
+shellcheck -x ghrctl tests/test.sh tests/live_artifact_test.sh tests/jit_ubuntu_24_04.sh tests/fixtures/fake-actions-runner/run.sh
 ```
 
-The functional suite intentionally runs with `sudo` because it exercises root-gated backup and state-management entry points. All test state is redirected to temporary directories.
+The functional suite injects a test-only root gate after sourcing the production CLI. All state and worker boundaries are redirected to temporary directories and the JIT host/API are fake. The separately guarded Ubuntu 24.04 test is destructive and must run only on a disposable host.
 
 ## Pull requests
 
