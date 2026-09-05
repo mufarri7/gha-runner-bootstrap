@@ -11,8 +11,15 @@ export GHRCTL_DATA_DIR="$TMP/var/lib/ghrctl"
 export GHRCTL_LOG_DIR="$TMP/var/log/ghrctl"
 export GHRCTL_LOCK_FILE="$TMP/var/lock/ghrctl.lock"
 export GHRCTL_BASE_ROOT="$TMP/srv/github-runners"
+export GHRCTL_JIT_BOUNDARY_ROOT="$TMP/srv/jit-boundaries"
+export GHRCTL_TEST_MODE=1
 # shellcheck source=../ghrctl
 source "$ROOT/ghrctl"
+
+need_root() {
+  [[ "$GHRCTL_STATE_DIR" == "$TMP"/* && "$GHRCTL_DATA_DIR" == "$TMP"/* && "$GHRCTL_BASE_ROOT" == "$TMP"/* && "$GHRCTL_JIT_BOUNDARY_ROOT" == "$TMP"/* ]] \
+    || fail "test root bypass escaped the temporary sandbox"
+}
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "expected '$2', got '$1'"; }
@@ -51,17 +58,24 @@ assert_jq "$MANIFEST" '.projects|length == 1'
 assert_jq "$MANIFEST" '.projects[0].runner_count == 0'
 
 BACKUP="$TMP/fixture.tar.zst"
-create_backup_archive project fixture "$BACKUP" >/dev/null
-[[ -s "$BACKUP" ]] || fail "backup was not created"
-RESTORE_TMP="$TMP/validate"; mkdir -p "$RESTORE_TMP/extract"
-validate_backup_archive "$BACKUP" "$RESTORE_TMP" >/dev/null
-assert_jq "$RESTORE_TMP/extract/backup.json" '.kind == "project" and .secret_free == true'
-if find "$RESTORE_TMP/extract" -type f \( -name '.runner' -o -name '.credentials*' \) | grep -q .; then
-  fail "credential material found in backup"
+if command -v zstd >/dev/null 2>&1; then
+  create_backup_archive project fixture "$BACKUP" >/dev/null
+  [[ -s "$BACKUP" ]] || fail "backup was not created"
+  RESTORE_TMP="$TMP/validate"; mkdir -p "$RESTORE_TMP/extract"
+  validate_backup_archive "$BACKUP" "$RESTORE_TMP" >/dev/null
+  assert_jq "$RESTORE_TMP/extract/backup.json" '.kind == "project" and .secret_free == true'
+  if find "$RESTORE_TMP/extract" -type f \( -name '.runner' -o -name '.credentials*' \) | grep -q .; then
+    fail "credential material found in backup"
+  fi
+else
+  printf 'SKIP: backup round-trip requires zstd.\n'
 fi
 
 safe_archive_name 'payload/projects/test.json' || fail "safe archive name rejected"
 if safe_archive_name '../etc/passwd'; then fail "unsafe archive name accepted"; fi
 
 bash -n "$ROOT/ghrctl" "$ROOT"/lib/*.sh
+
+# shellcheck source=jit_test.sh
+source "$ROOT/tests/jit_test.sh"
 printf 'All tests passed.\n'

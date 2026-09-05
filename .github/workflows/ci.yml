@@ -17,8 +17,8 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y shellcheck jq zstd
       - name: Bash syntax
-        run: bash -n ghrctl lib/*.sh tests/test.sh
+        run: bash -n ghrctl lib/*.sh tests/*.sh tests/fixtures/fake-actions-runner/run.sh
       - name: ShellCheck
-        run: shellcheck -x ghrctl tests/test.sh
+        run: shellcheck -x ghrctl tests/test.sh tests/jit_ubuntu_24_04.sh tests/fixtures/fake-actions-runner/run.sh
       - name: Functional tests
-        run: sudo ./tests/test.sh
+        run: ./tests/test.sh

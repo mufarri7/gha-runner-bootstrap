@@ -171,7 +171,7 @@ user_systemctl() {
   local user="$1"; shift
   local uid home
   uid="$(id -u "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"
-  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user "$@"
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user "$@"
 }
 
 ensure_rootless_docker() {
@@ -182,11 +182,11 @@ ensure_rootless_docker() {
   if user_systemctl "$user" is-active docker >/dev/null 2>&1; then success "Rootless Docker already active for $user."
   else
     info "Installing rootless Docker for $user..."
-    runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" dockerd-rootless-setuptool.sh install --force
+    runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" dockerd-rootless-setuptool.sh install --force
     user_systemctl "$user" daemon-reload
     user_systemctl "$user" enable --now docker
   fi
-  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" DOCKER_HOST="unix:///run/user/${uid}/docker.sock" docker info --format '{{json .SecurityOptions}}' | grep -qi rootless || die "Docker daemon for $user is not rootless."
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" DOCKER_HOST="unix:///run/user/${uid}/docker.sock" docker info --format '{{json .SecurityOptions}}' | grep -qi rootless || die "Docker daemon for $user is not rootless."
   success "Verified rootless Docker for $user."
 }
 
@@ -198,4 +198,3 @@ public_repo_warning() {
     confirm "I understand the risk and still want to register a persistent runner" "N" || die "Cancelled. Prefer a private repository or ephemeral/JIT isolation."
   fi
 }
-

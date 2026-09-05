@@ -30,7 +30,11 @@ Do not open a public issue containing credentials, exploit details, or a host-co
 - Validate state as JSON; never source project state as shell code.
 - Do not silently weaken SSH, firewall, AppArmor, user namespaces, or Docker security controls.
 - Require explicit acknowledgement before registering a persistent runner to a public repository.
+- Never accept a JIT label without independently verifying the trusted workflow run, attempt, admission job, current PR, exact base/head/merge/tree, ordered parents, freshness, and replay state.
+- Give each JIT job a fresh user, home, runner copy, process identity, and Rootless Docker daemon; destroy all mutable state after that one job.
+- Never pass controller credentials or encoded JIT configuration to candidate arguments, state, logs, homes, workspaces, or job environments.
+- Keep persistent broad-label runners stopped and disabled while JIT admissions can launch; rollback must not resume them automatically.
 
 ## Threat model boundary
 
-Rootless Docker reduces daemon privilege and separates repositories by host user, but it is not a complete sandbox against malicious kernel-level workloads or denial of service. A workflow with access to a persistent runner should be treated as trusted code within that repository's runner boundary.
+Rootless Docker reduces daemon privilege but is not a complete sandbox against malicious kernel-level workloads or denial of service. Admission-driven per-job users remove mutable cross-job state, but still share the host kernel. Prefer disposable VMs for hostile workloads and treat access to persistent runners as privileged.

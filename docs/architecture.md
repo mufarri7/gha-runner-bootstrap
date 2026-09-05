@@ -26,6 +26,12 @@ Different projects use different users and therefore different:
 - process ownership;
 - runner workspaces.
 
+## Admission-driven JIT boundary
+
+JIT workers do not reuse the persistent project user or Docker daemon. A verified admission controller creates one fresh user/home/runner copy/runtime/Rootless Docker daemon for each one-job runner, retains diagnostics outside that boundary, and destroys the user and filesystem after the runner exits. A bounded controller replaces exited workers while exact-label jobs remain queued.
+
+JIT policy, admission, worker, and migration records are root-only JSON. They contain identities and lifecycle state but never API credentials or encoded JIT configurations. See [Admission-driven clean JIT runners](jit-runner.md).
+
 ## State
 
 ```text
