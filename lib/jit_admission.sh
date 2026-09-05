@@ -28,7 +28,7 @@ jit_validate_positive_integer() {
 }
 
 jit_validate_policy_json() {
-  local file="$1" project repository workflow_path workflow_name admission_job trusted_branch label_prefix actor
+  local file="$1" project repository workflow_path workflow_name admission_job evidence_prefix trusted_branch label_prefix actor forbidden_label
   [[ -r "$file" ]] || die "JIT policy is not readable: $file"
   jq -e --argjson schema "$JIT_SCHEMA_VERSION" '
     .schema_version == $schema and
@@ -37,6 +37,7 @@ jit_validate_policy_json() {
     (.workflow_path | type == "string" and startswith(".github/workflows/")) and
     (.workflow_name | type == "string" and length > 0) and
     (.admission_job_name | type == "string" and length > 0) and
+    (.evidence_artifact_prefix | type == "string" and length > 0) and
     (.trusted_branch | type == "string" and length > 0) and
     (.allowed_actors | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
     (.label_prefix | type == "string" and length > 0) and
@@ -48,7 +49,7 @@ jit_validate_policy_json() {
     (.max_runtime_seconds | type == "number" and floor == . and . >= 60 and . <= 86400) and
     (.rootless_docker == true) and
     (.forbidden_online_labels | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
-    ((.persistent_project == null) or (.persistent_project | type == "string" and length > 0))
+    (.persistent_project | type == "string" and length > 0)
   ' "$file" >/dev/null || die "Invalid or unsafe JIT policy: $file"
 
   project="$(jq -r .project "$file")"
@@ -56,6 +57,7 @@ jit_validate_policy_json() {
   workflow_path="$(jq -r .workflow_path "$file")"
   workflow_name="$(jq -r .workflow_name "$file")"
   admission_job="$(jq -r .admission_job_name "$file")"
+  evidence_prefix="$(jq -r .evidence_artifact_prefix "$file")"
   trusted_branch="$(jq -r .trusted_branch "$file")"
   label_prefix="$(jq -r .label_prefix "$file")"
 
@@ -63,11 +65,28 @@ jit_validate_policy_json() {
   [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "Invalid JIT policy repository."
   [[ "$workflow_path" != *..* && "$workflow_path" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ ]] || die "Unsafe JIT workflow path."
   [[ "$workflow_name" != *$'\n'* && "$admission_job" != *$'\n'* ]] || die "JIT workflow and job names must be single-line strings."
+  [[ "$evidence_prefix" =~ ^[a-z0-9][a-z0-9-]{0,63}-$ ]] || die "Unsafe JIT evidence artifact prefix."
   [[ "$trusted_branch" =~ ^[A-Za-z0-9._/-]+$ && "$trusted_branch" != *..* ]] || die "Unsafe trusted branch."
   [[ "$label_prefix" =~ ^[a-z0-9][a-z0-9-]{0,39}-$ ]] || die "Unsafe JIT label prefix."
   while IFS= read -r actor; do
     [[ "$actor" =~ ^[A-Za-z0-9-]+$ ]] || die "Unsafe allowed actor in JIT policy: $actor"
   done < <(jq -r '.allowed_actors[]' "$file")
+  while IFS= read -r forbidden_label; do
+    [[ "$forbidden_label" =~ ^[A-Za-z0-9._-]+$ ]] || die "Unsafe forbidden runner label in JIT policy: $forbidden_label"
+  done < <(jq -r '.forbidden_online_labels[]' "$file")
+}
+
+jit_validate_policy_project_binding() {
+  local policy_file="$1" persistent_project project_state policy_repository state_repository
+  persistent_project="$(jq -r .persistent_project "$policy_file")"
+  project_state="$(project_file "$persistent_project")"
+  [[ -r "$project_state" ]] || die "JIT policy must reference an existing ghrctl project: $persistent_project"
+  validate_project_json "$project_state"
+  policy_repository="$(jq -r '.repository | ascii_downcase' "$policy_file")"
+  state_repository="$(jq -r '.repo_full_name | ascii_downcase' "$project_state")"
+  [[ "$policy_repository" == "$state_repository" ]] || die "JIT policy repository does not match persistent project state."
+  jq -e '.labels | length>0 and all(.[]; type=="string" and length>0 and test("^[A-Za-z0-9._-]+$"))' "$project_state" >/dev/null \
+    || die "Persistent project state has no safe reusable labels to quarantine."
 }
 
 jit_load_policy() {
@@ -80,6 +99,7 @@ jit_load_policy() {
   JIT_POLICY_WORKFLOW_PATH="$(jq -r .workflow_path "$file")"
   JIT_POLICY_WORKFLOW_NAME="$(jq -r .workflow_name "$file")"
   JIT_POLICY_ADMISSION_JOB="$(jq -r .admission_job_name "$file")"
+  JIT_POLICY_EVIDENCE_ARTIFACT_PREFIX="$(jq -r .evidence_artifact_prefix "$file")"
   JIT_POLICY_TRUSTED_BRANCH="$(jq -r .trusted_branch "$file")"
   JIT_POLICY_LABEL_PREFIX="$(jq -r .label_prefix "$file")"
   JIT_POLICY_RUNNER_GROUP_ID="$(jq -r .runner_group_id "$file")"
@@ -88,7 +108,8 @@ jit_load_policy() {
   JIT_POLICY_FRESHNESS_SECONDS="$(jq -r .freshness_seconds "$file")"
   JIT_POLICY_POLL_SECONDS="$(jq -r .poll_seconds "$file")"
   JIT_POLICY_MAX_RUNTIME_SECONDS="$(jq -r .max_runtime_seconds "$file")"
-  JIT_POLICY_PERSISTENT_PROJECT="$(jq -r '.persistent_project // empty' "$file")"
+  JIT_POLICY_PERSISTENT_PROJECT="$(jq -r .persistent_project "$file")"
+  jit_validate_policy_project_binding "$file"
 }
 
 jit_install_policy() {
@@ -98,6 +119,7 @@ jit_install_policy() {
   local source_file="${1:-}" project target
   [[ -n "$source_file" ]] || die "Usage: $0 jit install-policy FILE"
   jit_validate_policy_json "$source_file"
+  jit_validate_policy_project_binding "$source_file"
   project="$(jq -r .project "$source_file")"
   target="$(jit_policy_file "$project")"
   if [[ -e "$target" ]]; then
@@ -177,7 +199,7 @@ jit_configure_auth() {
       JIT_API_TOKEN="$(gh auth token)"
       ;;
     token)
-      prompt_secret JIT_API_TOKEN "One-time GitHub credential with Actions:read, Checks:read, Contents:read, Pull requests:read, and Administration:write"
+      prompt_secret JIT_API_TOKEN "One-time GitHub credential with Actions:read, Contents:read, Pull requests:read, and Administration:write"
       ;;
     app)
       : "${GHRCTL_JIT_APP_ID:?GHRCTL_JIT_APP_ID is required for --auth app}"
@@ -203,14 +225,9 @@ jit_api() {
   jit_curl_api_with_token "$JIT_API_TOKEN" "$method" "$endpoint" "$body"
 }
 
-jit_summary_has_line() {
-  local summary="$1" expected="$2"
-  grep -Fqx -- "$expected" <<<"$summary"
-}
-
 jit_verify_admission() {
   local run_id="$1" run_attempt="$2" pr_number="$3" base_sha="$4" head_sha="$5" merge_sha="$6" tree_sha="$7" label="$8"
-  local run latest_run workflow jobs job_count job check_run_url check_endpoint check summary pr merge_commit created_epoch now expected_label
+  local run latest_run workflow jobs job_count job evidence pr merge_commit created_epoch now expected_label
   run="$(jit_api GET "repos/${JIT_POLICY_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}")"
   latest_run="$(jit_api GET "repos/${JIT_POLICY_REPOSITORY}/actions/runs/${run_id}")"
 
@@ -229,24 +246,13 @@ jit_verify_admission() {
   [[ "$(jq -r .name <<<"$workflow")" == "$JIT_POLICY_WORKFLOW_NAME" ]] || die "Resolved workflow name mismatch."
   [[ "$(jq -r .state <<<"$workflow")" == active ]] || die "Admission workflow is not active."
 
-  jobs="$(jit_api GET "repos/${JIT_POLICY_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}/jobs?per_page=100")"
+  jobs="$(jit_api_collection "repos/${JIT_POLICY_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}/jobs" jobs)"
   job_count="$(jq --arg name "$JIT_POLICY_ADMISSION_JOB" '[.jobs[] | select(.name == $name)] | length' <<<"$jobs")"
   [[ "$job_count" == 1 ]] || die "Expected exactly one trusted admission job."
   job="$(jq -c --arg name "$JIT_POLICY_ADMISSION_JOB" '.jobs[] | select(.name == $name)' <<<"$jobs")"
   [[ "$(jq -r .status <<<"$job")" == completed && "$(jq -r .conclusion <<<"$job")" == success ]] || die "Trusted admission job did not complete successfully."
   [[ "$(jq -r .head_sha <<<"$job")" == "$base_sha" ]] || die "Admission job head SHA mismatch."
-  check_run_url="$(jq -r .check_run_url <<<"$job")"
-  check_endpoint="${check_run_url#https://api.github.com/}"
-  [[ "$check_endpoint" != "$check_run_url" ]] || die "Admission check-run URL is not a GitHub API URL."
-  check="$(jit_api GET "$check_endpoint")"
-  [[ "$(jq -r .status <<<"$check")" == completed && "$(jq -r .conclusion <<<"$check")" == success && "$(jq -r .head_sha <<<"$check")" == "$base_sha" ]] || die "Admission check run identity or conclusion mismatch."
-  summary="$(jq -r '.output.summary // empty' <<<"$check")"
-  [[ -n "$summary" ]] || die "Trusted admission summary is unavailable."
-  jit_summary_has_line "$summary" "- Base: $base_sha" || die "Admission summary base mismatch."
-  jit_summary_has_line "$summary" "- Head: $head_sha" || die "Admission summary head mismatch."
-  jit_summary_has_line "$summary" "- Merge: $merge_sha" || die "Admission summary merge mismatch."
-  jit_summary_has_line "$summary" "- Tree: $tree_sha" || die "Admission summary tree mismatch."
-  jit_summary_has_line "$summary" "- Per-run JIT label: $label" || die "Admission summary label mismatch."
+  evidence="$(jit_fetch_admission_evidence "$run" "$job" "$run_id" "$run_attempt" "$pr_number" "$base_sha" "$head_sha" "$merge_sha" "$tree_sha" "$label")"
 
   pr="$(jit_api GET "repos/${JIT_POLICY_REPOSITORY}/pulls/${pr_number}")"
   [[ "$(jq -r .state <<<"$pr")" == open ]] || die "Admission pull request is not open."
@@ -276,8 +282,8 @@ jit_verify_admission() {
     --arg run_created_at "$(jq -r .created_at <<<"$run")" \
     --arg run_url "$(jq -r .html_url <<<"$run")" \
     --arg admission_job_id "$(jq -r .id <<<"$job")" \
-    --arg check_run_id "$(jq -r .id <<<"$check")" \
-    '{workflow_id:($workflow_id|tonumber),run_created_at:$run_created_at,run_url:$run_url,admission_job_id:($admission_job_id|tonumber),check_run_id:($check_run_id|tonumber)}'
+    --argjson evidence "$evidence" \
+    '{workflow_id:($workflow_id|tonumber),run_created_at:$run_created_at,run_url:$run_url,admission_job_id:($admission_job_id|tonumber),evidence:$evidence}'
 }
 
 jit_parse_prepare_args() {
@@ -367,7 +373,7 @@ jit_set_admission_status() {
 }
 
 jit_get_run_jobs() {
-  jit_api GET "repos/${JIT_ADMISSION_REPOSITORY}/actions/runs/${JIT_ADMISSION_RUN_ID}/attempts/${JIT_ADMISSION_RUN_ATTEMPT}/jobs?per_page=100"
+  jit_api_collection "repos/${JIT_ADMISSION_REPOSITORY}/actions/runs/${JIT_ADMISSION_RUN_ID}/attempts/${JIT_ADMISSION_RUN_ATTEMPT}/jobs" jobs
 }
 
 jit_target_jobs() {

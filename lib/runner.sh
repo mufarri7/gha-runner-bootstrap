@@ -140,8 +140,18 @@ verify_runner_online_if_possible() {
   local repo_full="$1" runner_name="$2" json
   if have gh && gh auth status >/dev/null 2>&1; then
     for _ in 1 2 3 4 5 6; do
-      json="$(gh api "repos/${repo_full}/actions/runners" --paginate --slurp 2>/dev/null || true)"
-      if [[ -n "$json" ]] && jq -e --arg name "$runner_name" '[.[][]?.runners[]?]|any(.name==$name and .status=="online")' >/dev/null <<<"$json"; then
+      json="$(gh api "repos/${repo_full}/actions/runners?per_page=100" --paginate 2>/dev/null | jq -sc '
+        if length==0 or any(.[]; (.total_count|type)!="number" or (.runners|type)!="array") then error("invalid runner collection")
+        elif ([.[].total_count] | unique | length)!=1 then error("runner total changed")
+        else
+          .[0].total_count as $total | [.[].runners[]] as $runners |
+          if ($runners|length)!=$total then error("runner collection truncated")
+          elif (all($runners[]; (.id|type)=="number" and (.id|floor)==.id and .id>0) | not) then error("invalid runner identity")
+          elif ([$runners[].id]|length)!=([$runners[].id]|unique|length) then error("duplicate runner identity")
+          else {total_count:$total,runners:$runners} end
+        end
+      ' || true)"
+      if [[ -n "$json" ]] && jq -e --arg name "$runner_name" '.runners|any(.name==$name and .status=="online")' >/dev/null <<<"$json"; then
         success "GitHub API reports runner online: $runner_name"; return 0
       fi
       sleep 5

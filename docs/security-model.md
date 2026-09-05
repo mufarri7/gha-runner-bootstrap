@@ -22,11 +22,13 @@
 - secret-free backups and archive path validation;
 - no automatic SSH/firewall mutation;
 - explicit warning for public target repositories.
-- trusted-run/check-summary/PR/merge verification and replay protection before JIT configuration generation;
+- trusted-run/immutable-artifact/PR/merge verification and replay protection before JIT configuration generation;
 - unique-label-only JIT registration and bounded one-job worker replacement;
 - fresh per-job users, homes, runner copies, runtime directories, and Rootless Docker daemons;
 - root-owned diagnostics followed by remote deregistration and destructive local cleanup;
-- persistent-runner quarantine and non-automatic rollback.
+- write-ahead, resumable persistent-runner quarantine and non-automatic rollback;
+- complete fail-closed pagination for runner, workflow-job, and artifact inventories;
+- deterministic pre-mutation worker identity journals and partial-creation cleanup.
 
 ## Residual risks
 

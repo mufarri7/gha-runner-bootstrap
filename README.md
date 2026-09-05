@@ -41,9 +41,10 @@ Runners for the **same repository/trust boundary** may share that repository's r
 - Secret-free project and managed-host migration backups.
 - Server reconstruction with fresh runner registration credentials.
 - Optional GitHub API verification that a newly registered runner is online.
-- Owner-controlled, replay-resistant JIT admission verification against an exact trusted workflow run and merge identity.
+- Owner-controlled, replay-resistant JIT admission verification through a run-attempt/job-bound immutable artifact and exact merge identity.
 - Bounded one-job workers with a fresh Linux user, home, runner copy, Rootless Docker daemon, and destructive trusted cleanup per job.
-- Persistent-runner inventory, drain/quarantine, explicit recovery, and rollback that never silently restores broad-label access.
+- Complete fail-closed GitHub collection pagination and project-state-derived reusable-label rejection.
+- Write-ahead persistent-runner quarantine, resumable checkpoints, explicit recovery, and rollback that never silently restores broad-label access.
 
 ## Quick start
 
@@ -220,9 +221,9 @@ Tokens are read interactively and are never stored in project state, logs, manif
 
 ## Admission-driven clean JIT mode
 
-JIT mode is disabled by default and has no automatically enabled service. A root/operator must install a reviewed policy, prepare an exact trusted admission, complete persistent-runner quarantine, and explicitly launch that admission. Candidate workflows never receive runner-management authority.
+JIT mode is disabled by default and has no automatically enabled service. A root/operator must install a reviewed policy, retrieve and validate the exact trusted run-attempt admission artifact, complete journaled persistent-runner quarantine, and explicitly launch that admission. UI job summaries and logs are never admission authority, and candidate workflows never receive runner-management authority.
 
-Each JIT runner receives only its unique admission label and at most one job. Every worker uses a newly created Linux account, home, runner installation copy, and Rootless Docker daemon. Diagnostics move to root-owned external storage before the complete worker boundary is destroyed. Slot capacity and replacements are bounded.
+Each JIT runner receives only its unique admission label and at most one job. Every worker identity and path is persisted before the first host mutation, then creation is checkpointed through user, subordinate-ID, runner-copy, and Docker stages. Diagnostics move to root-owned external storage before the complete worker boundary is destroyed. Slot capacity and replacements are bounded.
 
 See [Admission-driven clean JIT runners](docs/jit-runner.md) and the mandatory pre-stable [Ubuntu 24.04 destructive validation plan](docs/jit-ubuntu-24.04-test-plan.md).
 

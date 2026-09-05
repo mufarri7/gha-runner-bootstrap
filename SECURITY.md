@@ -31,9 +31,13 @@ Do not open a public issue containing credentials, exploit details, or a host-co
 - Do not silently weaken SSH, firewall, AppArmor, user namespaces, or Docker security controls.
 - Require explicit acknowledgement before registering a persistent runner to a public repository.
 - Never accept a JIT label without independently verifying the trusted workflow run, attempt, admission job, current PR, exact base/head/merge/tree, ordered parents, freshness, and replay state.
+- Accept admission values only from a digest-verified immutable artifact bound to the exact run attempt and admission job; UI summaries and candidate logs are never authoritative.
+- Fully paginate runner, workflow-job, and admission-artifact inventories against stable totals or fail closed.
 - Give each JIT job a fresh user, home, runner copy, process identity, and Rootless Docker daemon; destroy all mutable state after that one job.
+- Persist deterministic worker identity before the first host mutation, and checkpoint every partial creation stage for restart-safe cleanup.
 - Never pass controller credentials or encoded JIT configuration to candidate arguments, state, logs, homes, workspaces, or job environments.
-- Keep persistent broad-label runners stopped and disabled while JIT admissions can launch; rollback must not resume them automatically.
+- Derive reusable labels from the bound persistent project state using case-insensitive comparison.
+- Journal persistent-runner quarantine before mutation and resume its per-service checkpoints idempotently; rollback must not resume services automatically.
 
 ## Threat model boundary
 

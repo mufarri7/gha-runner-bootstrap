@@ -16,6 +16,15 @@ jit_test_backend_enabled() {
   [[ "${GHRCTL_TEST_MODE:-0}" == 1 && "${GHRCTL_JIT_HOST_BACKEND:-production}" == fake && "$JIT_DATA_DIR" == /tmp/* && "$JIT_BOUNDARY_ROOT" == /tmp/* ]]
 }
 
+jit_fault_inject() {
+  local point="$1" requested="${GHRCTL_JIT_FAULT_POINT:-}"
+  [[ -n "$requested" ]] || return 0
+  if ! jit_test_backend_enabled && [[ "${GHRCTL_DESTRUCTIVE_TEST:-0}" != 1 || ${EUID} -ne 0 ]]; then
+    die "JIT fault injection is forbidden outside an isolated test backend or guarded destructive test."
+  fi
+  [[ "$requested" != "$point" ]] || die "Injected JIT fault at checkpoint: $point"
+}
+
 jit_verify_system_path() {
   local directory resolved owner mode
   IFS=: read -r -a _jit_path_parts <<<"$JIT_SYSTEM_PATH"
@@ -38,6 +47,8 @@ jit_require_clean_host_runtime() {
   have runuser || die "runuser is required for JIT workers."
   have useradd || die "useradd is required for JIT workers."
   have userdel || die "userdel is required for JIT cleanup."
+  have groupadd || die "groupadd is required for deterministic JIT worker groups."
+  have groupdel || die "groupdel is required for JIT cleanup."
   have dockerd-rootless-setuptool.sh || die "Rootless Docker tooling is required before JIT launch."
   have docker || die "Docker CLI is required before JIT launch."
   if systemctl is-active --quiet docker.service || systemctl is-active --quiet docker.socket || [[ -e /var/run/docker.sock || -L /var/run/docker.sock ]]; then
@@ -85,34 +96,105 @@ jit_worker_identity() {
   printf 'ghajit-%s-%03d' "${admission_id:0:8}" "$sequence"
 }
 
+jit_worker_uid() {
+  local admission_id="$1" sequence="$2" seed
+  seed=$((16#${admission_id:0:8}))
+  printf '%s' $((JIT_WORKER_UID_MIN + ((seed + sequence) % JIT_WORKER_UID_SPAN)))
+}
+
+jit_checkpoint_worker_creation() {
+  local state_file="$1" stage="$2" status="${3:-creating}" temporary
+  temporary="${state_file}.tmp.$$.$RANDOM"
+  jq --arg stage "$stage" --arg status "$status" --arg now "$(utc_now)" '.creation_stage=$stage | .status=$status | .updated_at=$now' "$state_file" >"$temporary"
+  chmod 600 "$temporary"; mv "$temporary" "$state_file"
+}
+
+jit_plan_worker_identity() {
+  local state_file="$1" sequence="$2" admission_id worker_id user uid worker_root home runner_dir docker_socket temporary
+  admission_id="$JIT_ADMISSION_ID"; worker_id="${state_file##*/}"; worker_id="${worker_id%.json}"
+  user="$(jit_worker_identity "$admission_id" "$sequence")"; uid="$(jit_worker_uid "$admission_id" "$sequence")"
+  worker_root="${JIT_BOUNDARY_ROOT}/${admission_id}/${worker_id}.boundary"; home="${worker_root}/home"; runner_dir="${home}/actions-runner"
+  if jit_test_backend_enabled; then docker_socket="${worker_root}/runtime/docker.sock"; else docker_socket="/run/user/${uid}/docker.sock"; fi
+  jit_assert_safe_worker_path "$worker_root"
+  temporary="${state_file}.tmp.$$.$RANDOM"
+  jq --arg sequence "$sequence" --arg user "$user" --arg uid "$uid" --arg group "$user" --arg root "$worker_root" --arg home "$home" --arg runner_dir "$runner_dir" --arg docker_socket "$docker_socket" --arg now "$(utc_now)" '
+    .sequence=($sequence|tonumber) | .user=$user | .uid=($uid|tonumber) | .group=$group | .root=$root | .home=$home |
+    .runner_dir=$runner_dir | .docker_socket=$docker_socket | .status="creating" | .creation_stage="identity-persisted" | .updated_at=$now
+  ' "$state_file" >"$temporary"
+  chmod 600 "$temporary"; mv "$temporary" "$state_file"
+}
+
+jit_load_worker_identity() {
+  local state_file="$1"
+  JIT_WORKER_USER="$(jq -r .user "$state_file")"; JIT_WORKER_UID="$(jq -r .uid "$state_file")"
+  JIT_WORKER_GROUP="$(jq -r .group "$state_file")"; JIT_WORKER_ROOT="$(jq -r .root "$state_file")"
+  JIT_WORKER_HOME="$(jq -r .home "$state_file")"; JIT_WORKER_RUNNER_DIR="$(jq -r .runner_dir "$state_file")"
+  JIT_WORKER_DOCKER_SOCKET="$(jq -r .docker_socket "$state_file")"
+}
+
 jit_create_worker_boundary() {
-  local admission_id="$1" worker_id="$2" sequence="$3" user worker_root home runner_dir uid start end
-  user="$(jit_worker_identity "$admission_id" "$sequence")"
-  worker_root="${JIT_BOUNDARY_ROOT}/${admission_id}/${worker_id}.boundary"
-  home="${worker_root}/home"
-  runner_dir="${home}/actions-runner"
+  local state_file="$1" user uid group worker_root home runner_dir docker_socket start end
+  jit_load_worker_identity "$state_file"
+  user="$JIT_WORKER_USER"; uid="$JIT_WORKER_UID"; group="$JIT_WORKER_GROUP"; worker_root="$JIT_WORKER_ROOT"
+  home="$JIT_WORKER_HOME"; runner_dir="$JIT_WORKER_RUNNER_DIR"; docker_socket="$JIT_WORKER_DOCKER_SOCKET"
+  [[ "$user" == "$(jit_worker_identity "$JIT_ADMISSION_ID" "$(jq -r .sequence "$state_file")")" && "$uid" == "$(jit_worker_uid "$JIT_ADMISSION_ID" "$(jq -r .sequence "$state_file")")" ]] \
+    || die "Persisted JIT worker identity is not deterministic."
   jit_assert_safe_worker_path "$worker_root"
   [[ ! -e "$worker_root" ]] || die "JIT worker boundary already exists: $worker_root"
 
   if jit_test_backend_enabled; then
     mkdir -p "$runner_dir" "${home}/.local/share/docker" "${worker_root}/runtime"
+    jit_fault_inject worker-after-boundary-mutation
+    jit_checkpoint_worker_creation "$state_file" boundary-created
+    jit_checkpoint_worker_creation "$state_file" group-create-started
+    : >"${worker_root}/.fake-group"
+    jit_fault_inject worker-after-group-mutation
+    jit_checkpoint_worker_creation "$state_file" group-created
+    jit_checkpoint_worker_creation "$state_file" user-create-started
+    : >"${worker_root}/.fake-user"
+    jit_fault_inject worker-after-user-mutation
+    jit_checkpoint_worker_creation "$state_file" user-created
+    : >"${worker_root}/.fake-subids"
+    jit_fault_inject worker-after-subids-mutation
+    jit_checkpoint_worker_creation "$state_file" subids-allocated
     cp -a "$JIT_RUNNER_SEED/." "$runner_dir/"
+    jit_fault_inject worker-after-runner-seed-mutation
+    jit_checkpoint_worker_creation "$state_file" runner-seed-copied
     chmod 700 "$home" "${worker_root}/runtime"
-    JIT_WORKER_USER="$user"; JIT_WORKER_UID="$((50000 + sequence))"; JIT_WORKER_ROOT="$worker_root"; JIT_WORKER_HOME="$home"; JIT_WORKER_RUNNER_DIR="$runner_dir"
-    JIT_WORKER_DOCKER_SOCKET="${worker_root}/runtime/docker.sock"
-    : >"$JIT_WORKER_DOCKER_SOCKET"
+    : >"${worker_root}/.fake-linger"
+    jit_fault_inject worker-after-linger-mutation
+    jit_checkpoint_worker_creation "$state_file" linger-enabled
+    : >"${worker_root}/.fake-user-manager"
+    jit_fault_inject worker-after-user-manager-mutation
+    jit_checkpoint_worker_creation "$state_file" user-manager-started
+    : >"$docker_socket"
+    jit_fault_inject worker-after-docker-mutation
+    jit_checkpoint_worker_creation "$state_file" docker-started
+    jit_checkpoint_worker_creation "$state_file" ready boundary-ready
     return 0
   fi
 
   exec 8>"${JIT_DATA_DIR}/host-mutation.lock"
   flock 8
   id "$user" >/dev/null 2>&1 && die "JIT worker user already exists: $user"
+  getent group "$group" >/dev/null 2>&1 && die "JIT worker group already exists: $group"
+  getent passwd "$uid" >/dev/null 2>&1 && die "Deterministic JIT worker UID is already allocated: $uid"
+  getent group "$uid" >/dev/null 2>&1 && die "Deterministic JIT worker GID is already allocated: $uid"
   mkdir -p "$(dirname "$worker_root")" "$worker_root"
   chmod 711 "$(dirname "$worker_root")"
   chmod 755 "$worker_root"
-  useradd --create-home --home-dir "$home" --shell /bin/bash --user-group "$user"
+  jit_fault_inject worker-after-boundary-mutation
+  jit_checkpoint_worker_creation "$state_file" boundary-created
+  jit_checkpoint_worker_creation "$state_file" group-create-started
+  groupadd --gid "$uid" "$group"
+  jit_fault_inject worker-after-group-mutation
+  jit_checkpoint_worker_creation "$state_file" group-created
+  jit_checkpoint_worker_creation "$state_file" user-create-started
+  useradd --create-home --home-dir "$home" --shell /bin/bash --uid "$uid" --gid "$group" "$user"
+  jit_fault_inject worker-after-user-mutation
+  jit_checkpoint_worker_creation "$state_file" user-created
   passwd -l "$user" >/dev/null 2>&1 || true
-  uid="$(id -u "$user")"
+  [[ "$(id -u "$user")" == "$uid" && "$(id -g "$user")" == "$uid" ]] || die "Created JIT worker identity does not match the journal."
   if id -nG "$user" | tr ' ' '\n' | grep -Eq '^(sudo|wheel|docker)$'; then
     die "JIT worker user belongs to a privileged group: $user"
   fi
@@ -122,21 +204,29 @@ jit_create_worker_boundary() {
   if ! awk -F: -v u="$user" '$1==u && $3>=65536 {found=1} END {exit !found}' /etc/subgid; then
     start="$(next_subid_start)"; end=$((start + 65535)); usermod --add-subgids "${start}-${end}" "$user"
   fi
+  jit_fault_inject worker-after-subids-mutation
+  jit_checkpoint_worker_creation "$state_file" subids-allocated
   chown root:"$user" "$worker_root"; chmod 710 "$worker_root"
   chmod 700 "$home"
   mkdir -p "$runner_dir"
   cp -a "$JIT_RUNNER_SEED/." "$runner_dir/"
   chown -R "$user:$user" "$home"
   find "$runner_dir" -type d -exec chmod u+rwx {} +
+  jit_fault_inject worker-after-runner-seed-mutation
+  jit_checkpoint_worker_creation "$state_file" runner-seed-copied
   loginctl enable-linger "$user"
+  jit_fault_inject worker-after-linger-mutation
+  jit_checkpoint_worker_creation "$state_file" linger-enabled
   systemctl start "user@${uid}.service"
+  jit_fault_inject worker-after-user-manager-mutation
+  jit_checkpoint_worker_creation "$state_file" user-manager-started
   ensure_rootless_docker "$user"
+  [[ -S "$docker_socket" ]] || die "Dedicated Rootless Docker socket is unavailable for $user"
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="$JIT_SYSTEM_PATH" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" DOCKER_HOST="unix://${docker_socket}" docker info --format '{{json .SecurityOptions}}' | grep -qi rootless || die "JIT Docker daemon is not rootless."
+  jit_fault_inject worker-after-docker-mutation
+  jit_checkpoint_worker_creation "$state_file" docker-started
   flock -u 8
-
-  JIT_WORKER_USER="$user"; JIT_WORKER_UID="$uid"; JIT_WORKER_ROOT="$worker_root"; JIT_WORKER_HOME="$home"; JIT_WORKER_RUNNER_DIR="$runner_dir"
-  JIT_WORKER_DOCKER_SOCKET="/run/user/${uid}/docker.sock"
-  [[ -S "$JIT_WORKER_DOCKER_SOCKET" ]] || die "Dedicated Rootless Docker socket is unavailable for $user"
-  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="$JIT_SYSTEM_PATH" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" DOCKER_HOST="unix://${JIT_WORKER_DOCKER_SOCKET}" docker info --format '{{json .SecurityOptions}}' | grep -qi rootless || die "JIT Docker daemon is not rootless."
+  jit_checkpoint_worker_creation "$state_file" ready boundary-ready
 }
 
 jit_generate_config() {
@@ -171,17 +261,8 @@ jit_write_worker_state() {
     ' "$state_file" >"$temporary"
   else
     jq -n --argjson schema_version "$JIT_SCHEMA_VERSION" --arg admission_id "$JIT_ADMISSION_ID" --arg worker_id "${state_file##*/}" --arg status "$status" --arg now "$(utc_now)" --arg note "$note" \
-      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,root:null,home:null,runner_dir:null,docker_socket:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' >"$temporary"
+      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,group:null,root:null,home:null,runner_dir:null,docker_socket:null,creation_stage:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' >"$temporary"
   fi
-  chmod 600 "$temporary"; mv "$temporary" "$state_file"
-}
-
-jit_record_worker_boundary() {
-  local state_file="$1" sequence="$2" temporary
-  temporary="${state_file}.tmp.$$.$RANDOM"
-  jq --arg sequence "$sequence" --arg user "$JIT_WORKER_USER" --arg uid "$JIT_WORKER_UID" --arg root "$JIT_WORKER_ROOT" --arg home "$JIT_WORKER_HOME" --arg runner_dir "$JIT_WORKER_RUNNER_DIR" --arg docker_socket "$JIT_WORKER_DOCKER_SOCKET" --arg now "$(utc_now)" '
-    .sequence=($sequence|tonumber) | .user=$user | .uid=($uid|tonumber) | .root=$root | .home=$home | .runner_dir=$runner_dir | .docker_socket=$docker_socket | .status="boundary-ready" | .updated_at=$now
-  ' "$state_file" >"$temporary"
   chmod 600 "$temporary"; mv "$temporary" "$state_file"
 }
 
@@ -213,7 +294,7 @@ jit_capture_worker_diagnostics() {
 
 jit_runner_exists_remotely() {
   local runner_id="$1" runners
-  runners="$(jit_api GET "repos/${JIT_ADMISSION_REPOSITORY}/actions/runners?per_page=100")"
+  runners="$(jit_api_collection "repos/${JIT_ADMISSION_REPOSITORY}/actions/runners" runners)"
   jq -e --arg id "$runner_id" '.runners | any((.id|tostring)==$id)' >/dev/null <<<"$runners"
 }
 
@@ -225,15 +306,43 @@ jit_deregister_runner() {
   fi
 }
 
+jit_stage_may_own_group() {
+  case "$1" in
+    group-create-started|group-created|user-create-started|user-created|subids-allocated|runner-seed-copied|linger-enabled|user-manager-started|docker-started|ready) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+jit_stage_may_own_user() {
+  case "$1" in
+    user-create-started|user-created|subids-allocated|runner-seed-copied|linger-enabled|user-manager-started|docker-started|ready) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+jit_validate_worker_identity_state() {
+  local state_file="$1" admission_id worker_id sequence expected_user expected_uid expected_root expected_home expected_runner expected_socket
+  admission_id="$(jq -r .admission_id "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; sequence="$(jq -r '.sequence // empty' "$state_file")"
+  [[ "$admission_id" =~ ^[0-9a-f]{64}$ && "$worker_id" =~ ^worker-[0-9]{3,}$ && "$sequence" =~ ^[1-9][0-9]*$ ]] || return 1
+  expected_user="$(jit_worker_identity "$admission_id" "$sequence")"; expected_uid="$(jit_worker_uid "$admission_id" "$sequence")"
+  expected_root="${JIT_BOUNDARY_ROOT}/${admission_id}/${worker_id}.boundary"; expected_home="${expected_root}/home"; expected_runner="${expected_home}/actions-runner"
+  if jit_test_backend_enabled; then expected_socket="${expected_root}/runtime/docker.sock"; else expected_socket="/run/user/${expected_uid}/docker.sock"; fi
+  [[ "$(jq -r .user "$state_file")" == "$expected_user" && "$(jq -r .group "$state_file")" == "$expected_user" && "$(jq -r .uid "$state_file")" == "$expected_uid" &&
+     "$(jq -r .root "$state_file")" == "$expected_root" && "$(jq -r .home "$state_file")" == "$expected_home" &&
+     "$(jq -r .runner_dir "$state_file")" == "$expected_runner" && "$(jq -r .docker_socket "$state_file")" == "$expected_socket" ]] || return 1
+  jit_assert_safe_worker_path "$expected_root"
+}
+
 jit_destroy_worker_boundary() {
-  local user="$1" uid="$2" worker_root="$3"
+  local user="$1" uid="$2" group="$3" worker_root="$4" creation_stage="$5"
   [[ -n "$worker_root" && "$worker_root" != null ]] || return 0
   jit_assert_safe_worker_path "$worker_root"
   if jit_test_backend_enabled; then
     rm -rf --one-file-system "$worker_root"
     return 0
   fi
-  if [[ -n "$user" && "$user" != null ]] && id "$user" >/dev/null 2>&1; then
+  [[ "$uid" =~ ^[1-9][0-9]*$ && "$user" =~ ^ghajit-[a-f0-9]{8}-[0-9]{3,}$ && "$group" == "$user" ]] || return 1
+  if jit_stage_may_own_user "$creation_stage" && id "$user" >/dev/null 2>&1; then
     user_systemctl "$user" stop docker >/dev/null 2>&1 || true
     loginctl terminate-user "$user" >/dev/null 2>&1 || true
     pkill -TERM -u "$user" >/dev/null 2>&1 || true
@@ -244,18 +353,30 @@ jit_destroy_worker_boundary() {
     if pgrep -u "$user" >/dev/null 2>&1; then return 1; fi
     userdel --remove "$user" >/dev/null 2>&1 || return 1
   fi
+  if jit_stage_may_own_group "$creation_stage" && getent group "$group" >/dev/null 2>&1; then
+    groupdel "$group" >/dev/null 2>&1 || return 1
+  fi
+  getent passwd "$user" >/dev/null 2>&1 && return 1
+  getent group "$group" >/dev/null 2>&1 && return 1
+  grep -qE "^${user}:" /etc/subuid /etc/subgid 2>/dev/null && return 1
+  [[ ! -e "/run/user/${uid}" ]] || return 1
   if findmnt -rn -R "$worker_root" | grep -q .; then return 1; fi
   rm -rf --one-file-system "$worker_root"
 }
 
 jit_cleanup_worker_state() {
-  local state_file="$1" user uid worker_root runner_dir runner_id worker_id admission_id cleanup_failed=0
+  local state_file="$1" user uid group worker_root runner_dir runner_id worker_id admission_id creation_stage cleanup_failed=0
   [[ -r "$state_file" ]] || return 0
+  if [[ "$(jq -r '.sequence // empty' "$state_file")" != "" ]] && ! jit_validate_worker_identity_state "$state_file"; then
+    jit_write_worker_state "$state_file" cleanup-pending "Persisted worker identity failed deterministic validation."
+    return 1
+  fi
   user="$(jq -r '.user // empty' "$state_file")"; uid="$(jq -r '.uid // empty' "$state_file")"
+  group="$(jq -r '.group // empty' "$state_file")"; creation_stage="$(jq -r '.creation_stage // empty' "$state_file")"
   worker_root="$(jq -r '.root // empty' "$state_file")"; runner_dir="$(jq -r '.runner_dir // empty' "$state_file")"
   runner_id="$(jq -r '.runner_id // empty' "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; admission_id="$(jq -r .admission_id "$state_file")"
   jit_capture_worker_diagnostics "$admission_id" "$worker_id" "$worker_root" "$runner_dir" || cleanup_failed=1
-  jit_destroy_worker_boundary "$user" "$uid" "$worker_root" || cleanup_failed=1
+  jit_destroy_worker_boundary "$user" "$uid" "$group" "$worker_root" "$creation_stage" || cleanup_failed=1
   jit_deregister_runner "$runner_id" || cleanup_failed=1
   if (( cleanup_failed == 0 )); then
     jit_write_worker_state "$state_file" cleaned
@@ -294,8 +415,8 @@ jit_worker_process() (
     sleep 0.1
   done
   [[ "$(jq -r '.controller_pid // 0' "$state_file")" =~ ^[1-9][0-9]*$ ]] || die "Controller failed to publish the worker process identity."
-  jit_create_worker_boundary "$JIT_ADMISSION_ID" "$worker_id" "$sequence"
-  jit_record_worker_boundary "$state_file" "$sequence"
+  jit_create_worker_boundary "$state_file"
+  jit_load_worker_identity "$state_file"
   jit_generate_config "$JIT_WORKER_USER" "$state_file"
   config="$JIT_GENERATED_CONFIG"
   unset JIT_GENERATED_CONFIG
@@ -325,7 +446,7 @@ jit_active_worker_count() {
   shopt -s nullglob
   for file in "$state_dir"/*.json; do
     status="$(jq -r .status "$file")"
-    if [[ "$status" =~ ^(starting|boundary-ready|registered|running)$ ]] && jit_worker_pid_is_active "$file"; then ((count+=1)); fi
+    if [[ "$status" =~ ^(creating|boundary-ready|registered|running)$ ]] && jit_worker_pid_is_active "$file"; then ((count+=1)); fi
   done
   shopt -u nullglob
   printf '%s' "$count"
@@ -360,9 +481,10 @@ jit_spawn_worker() {
   worker_id="worker-$(printf '%03d' "$sequence")"
   state_file="$(jit_worker_state_file "$JIT_ADMISSION_ID" "$worker_id")"
   jit_write_worker_state "$state_file" allocated
+  jit_plan_worker_identity "$state_file" "$sequence"
   jit_worker_process "$state_file" "$sequence" &
   pid=$!
-  jit_write_worker_state "$state_file" starting "" "" "$pid"
+  jit_write_worker_state "$state_file" creating "" "" "$pid"
 }
 
 jit_cleanup_admission_workers() {
@@ -372,7 +494,7 @@ jit_cleanup_admission_workers() {
   shopt -s nullglob
   for file in "$state_dir"/*.json; do
     pid="$(jq -r '.controller_pid // 0' "$file")"; status="$(jq -r .status "$file")"
-    if [[ "$status" =~ ^(starting|boundary-ready|registered|running)$ ]] && jit_worker_pid_is_active "$file"; then
+    if [[ "$status" =~ ^(creating|boundary-ready|registered|running)$ ]] && jit_worker_pid_is_active "$file"; then
       user="$(jq -r '.user // empty' "$file")"
       if ! jit_test_backend_enabled && [[ -n "$user" ]] && id "$user" >/dev/null 2>&1; then
         pkill -TERM -u "$user" >/dev/null 2>&1 || true
@@ -399,7 +521,7 @@ jit_cleanup_stale_worker_states() {
   shopt -s nullglob
   for file in "$state_dir"/*.json; do
     status="$(jq -r .status "$file")"
-    if [[ "$status" =~ ^(allocated|starting|boundary-ready|registered|running|cleanup-pending)$ ]] && ! jit_worker_pid_is_active "$file"; then
+    if [[ "$status" =~ ^(allocated|creating|boundary-ready|registered|running|cleanup-pending)$ ]] && ! jit_worker_pid_is_active "$file"; then
       jit_cleanup_worker_state "$file" || return 1
     fi
   done

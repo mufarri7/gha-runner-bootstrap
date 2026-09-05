@@ -22,7 +22,7 @@ Record users, UIDs, homes, runner directories, process probes, Rootless Docker s
 
 ## End-to-end private canary
 
-1. Create a private canary repository and a trusted-main `workflow_dispatch` admission workflow with the same identity/summary contract.
+1. Create a private canary repository and a trusted-main `workflow_dispatch` admission workflow that uploads the strict run-attempt/job-bound `admission.json` artifact.
 2. Queue three uniquely labelled jobs: two overlapping jobs plus a third job that remains queued.
 3. Install a canary JIT policy with `max_slots: 2`; use a minimum-permission GitHub App installation.
 4. Verify the two initial jobs receive different users, homes, runner installations, process identities, Rootless Docker sockets, Docker data roots, and workspaces.
@@ -32,15 +32,17 @@ Record users, UIDs, homes, runner directories, process probes, Rootless Docker s
 8. Repeat with job success, failure, cancellation, controller `SIGTERM`, and a VM restart during a job. Run `jit resume` after restart and verify stale cleanup precedes any replacement.
 9. Verify runner and controller diagnostics remain in root-owned external storage after every worker directory is gone and contain no credential/JIT configuration.
 10. Attempt stale run, replay, wrong repository/workflow/attempt/actor/SHA/label, failed/skipped admission, default labels, active broad-label persistent runner, rootful Docker socket, writable PATH, replacement exhaustion, and cleanup mount failures. Every case must fail closed.
+11. Inject a failure after every boundary/group/user/subid/runner-copy/linger/user-manager/Docker mutation but before its completion checkpoint, and prove deterministic cleanup from the persisted worker journal.
 
 ## Migration and rollback rehearsal
 
 1. Register disposable persistent runners with broad labels and run a bounded canary job.
 2. Capture `jit migration-plan` JSON.
-3. Confirm quarantine waits for the active job, stops and disables services, and refuses JIT while any broad-label runner remains online.
-4. Run a canary JIT admission only after the remote inventory is clean.
-5. Run `jit rollback`; prove JIT state is destroyed and persistent services remain stopped/disabled.
-6. Re-enable persistent services only through a separate explicit owner-reviewed `resume-project` operation.
+3. Inject faults after journaling, after every per-service drain/stop/disable operation but before its completion checkpoint, and before/after remote verification; resume the same `preparing` journal and confirm it reaches `quarantined` idempotently.
+4. Confirm quarantine waits for the active job, stops and disables services, and refuses JIT while any case-variant or project-derived broad-label runner remains online on any API page.
+5. Run a canary JIT admission only after the remote inventory is clean.
+6. Run `jit rollback`; prove JIT state is destroyed and persistent services remain stopped/disabled.
+7. Re-enable persistent services only through a separate explicit owner-reviewed `resume-project` operation.
 
 ## Evidence and result labels
 

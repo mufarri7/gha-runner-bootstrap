@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
-  "project": "mazaya",
+  "project": "mazaya-backend",
   "repository": "mufarri7/mazaya_backend",
   "workflow_path": ".github/workflows/trusted-self-hosted-data-plane.yml",
   "workflow_name": "Trusted Self-Hosted Data Plane",
   "admission_job_name": "Admit exact candidate from trusted main",
+  "evidence_artifact_prefix": "ghrctl-jit-admission-",
   "trusted_branch": "main",
   "allowed_actors": [
     "mufarri7"
@@ -23,7 +24,7 @@
     "x64",
     "arm64",
     "shared-ci",
-    "mazaya-ci"
+    "mazaya-backend-ci"
   ],
-  "persistent_project": "mazaya"
+  "persistent_project": "mazaya-backend"
 }
