@@ -50,6 +50,10 @@ esac
 staged_runtime_helper="$(jit_stage_runtime_helper)"
 [[ "$staged_runtime_helper" != "$GHRCTL_ROOT"/* && "$staged_runtime_helper" == "$JIT_RUNTIME_DIR"/* ]] || { printf 'JIT did not use the root-owned staged runtime path.\n' >&2; exit 1; }
 [[ "$(stat -c '%u:%a' "$staged_runtime_helper")" == 0:* ]] || { printf 'Staged JIT helper is not root-owned.\n' >&2; exit 1; }
+jq -e --arg revision "$(jit_runtime_controller_revision)" --arg helper "$staged_runtime_helper" \
+  --arg helper_sha256 "$(sha256sum "$staged_runtime_helper" | awk '{print $1}')" \
+  '.schema_version == 1 and .controller_revision == $revision and .helper == $helper and .helper_sha256 == $helper_sha256' \
+  "$JIT_RUNTIME_MANIFEST" >/dev/null || { printf 'JIT runtime manifest is not bound to the staged helper.\n' >&2; exit 1; }
 JIT_POLICY_REAL_ID_START=50000
 JIT_POLICY_REAL_ID_END=59999
 JIT_POLICY_SUBID_START=1000000000
