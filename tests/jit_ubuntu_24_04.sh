@@ -47,13 +47,21 @@ case "$GHRCTL_ROOT" in
   /home/*|/root/*) ;;
   *) printf 'This regression must execute the production backend from /home or /root.\n' >&2; exit 1 ;;
 esac
-staged_runtime_helper="$(jit_stage_runtime_helper)"
+staged_runtime_helper=""; staged_runtime_manifest=""
+jit_stage_runtime_helper staged_runtime_helper staged_runtime_manifest
 [[ "$staged_runtime_helper" != "$GHRCTL_ROOT"/* && "$staged_runtime_helper" == "$JIT_RUNTIME_DIR"/* ]] || { printf 'JIT did not use the root-owned staged runtime path.\n' >&2; exit 1; }
 [[ "$(stat -c '%u:%a' "$staged_runtime_helper")" == 0:* ]] || { printf 'Staged JIT helper is not root-owned.\n' >&2; exit 1; }
 jq -e --arg revision "$(jit_runtime_controller_revision)" --arg helper "$staged_runtime_helper" \
   --arg helper_sha256 "$(sha256sum "$staged_runtime_helper" | awk '{print $1}')" \
-  '.schema_version == 1 and .controller_revision == $revision and .helper == $helper and .helper_sha256 == $helper_sha256' \
-  "$JIT_RUNTIME_MANIFEST" >/dev/null || { printf 'JIT runtime manifest is not bound to the staged helper.\n' >&2; exit 1; }
+  '.schema_version == 1 and (.controller_manifest.files|length)==6 and .controller_revision == $revision and .helper == $helper and .helper_sha256 == $helper_sha256' \
+  "$staged_runtime_manifest" >/dev/null || { printf 'JIT runtime manifest is not bound to the staged helper.\n' >&2; exit 1; }
+JIT_ADMISSION_RUNTIME_HELPER="$staged_runtime_helper"
+JIT_ADMISSION_RUNTIME_MANIFEST="$staged_runtime_manifest"
+JIT_ADMISSION_RUNTIME_HELPER_SHA256="$(sha256sum "$staged_runtime_helper" | awk '{print $1}')"
+JIT_ADMISSION_RUNTIME_CONTROLLER_REVISION="$(jit_runtime_controller_revision)"
+JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST="$(jit_runtime_controller_digest)"
+JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST="$(jq -c '.controller_manifest' "$staged_runtime_manifest")"
+JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256="$(jq -r '.controller_manifest_sha256' "$staged_runtime_manifest")"
 JIT_POLICY_REAL_ID_START=50000
 JIT_POLICY_REAL_ID_END=59999
 JIT_POLICY_SUBID_START=1000000000
@@ -68,11 +76,19 @@ jit_write_worker_state "$state_one" allocated
 jit_plan_worker_identity "$state_one" 1
 jit_create_worker_boundary "$state_one"
 user_one="$JIT_WORKER_USER"; uid_one="$JIT_WORKER_UID"; root_one="$JIT_WORKER_ROOT"; home_one="$JIT_WORKER_HOME"; socket_one="$JIT_WORKER_DOCKER_SOCKET"
+runtime_one="$JIT_WORKER_RUNTIME_DIR"
+[[ "$socket_one" == "$runtime_one/docker.sock" ]] || { printf 'Worker one socket was not placed under its private runtime.\n' >&2; exit 1; }
+jit_assert_unix_socket_path "$socket_one" || { printf 'Worker one Docker socket exceeds Linux AF_UNIX limits.\n' >&2; exit 1; }
+[[ "$runtime_one" == "$JIT_WORKER_RUNTIME_ROOT"/* && "$(stat -c '%u:%a' "$runtime_one")" == "$uid_one:700" ]] || { printf 'Worker one runtime is not private and persistently bounded.\n' >&2; exit 1; }
 state_two="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-002)"
 jit_write_worker_state "$state_two" allocated
 jit_plan_worker_identity "$state_two" 2
 jit_create_worker_boundary "$state_two"
 user_two="$JIT_WORKER_USER"; uid_two="$JIT_WORKER_UID"; root_two="$JIT_WORKER_ROOT"; home_two="$JIT_WORKER_HOME"; socket_two="$JIT_WORKER_DOCKER_SOCKET"
+runtime_two="$JIT_WORKER_RUNTIME_DIR"
+[[ "$socket_two" == "$runtime_two/docker.sock" ]] || { printf 'Worker two socket was not placed under its private runtime.\n' >&2; exit 1; }
+jit_assert_unix_socket_path "$socket_two" || { printf 'Worker two Docker socket exceeds Linux AF_UNIX limits.\n' >&2; exit 1; }
+[[ "$runtime_two" == "$JIT_WORKER_RUNTIME_ROOT"/* && "$(stat -c '%u:%a' "$runtime_two")" == "$uid_two:700" ]] || { printf 'Worker two runtime is not private and persistently bounded.\n' >&2; exit 1; }
 
 [[ "$user_one" != "$user_two" && "$home_one" != "$home_two" && "$socket_one" != "$socket_two" ]] || { printf 'Worker boundaries overlap.\n' >&2; exit 1; }
 subuid_one="$(jq -r .subuid.start "$state_one")"; subuid_two="$(jq -r .subuid.start "$state_two")"
@@ -142,13 +158,14 @@ setpriv --reuid "$uid_two" --regid "$uid_two" --clear-groups test ! -r "$socket_
 root_one_docker="$(nsenter --target "$main_one" --net --mount -- setpriv --reuid "$uid_one" --regid "$uid_one" --clear-groups env HOME="$home_one" XDG_RUNTIME_DIR="$(dirname "$socket_one")" DOCKER_HOST="unix://${socket_one}" docker info --format '{{.DockerRootDir}}')"
 root_two_docker="$(nsenter --target "$main_two" --net --mount -- setpriv --reuid "$uid_two" --regid "$uid_two" --clear-groups env HOME="$home_two" XDG_RUNTIME_DIR="$(dirname "$socket_two")" DOCKER_HOST="unix://${socket_two}" docker info --format '{{.DockerRootDir}}')"
 [[ "$root_one_docker" != "$root_two_docker" ]] || { printf 'Rootless Docker data roots overlap.\n' >&2; exit 1; }
+[[ -S "$socket_one" && -S "$socket_two" ]] || { printf 'Rootless Docker sockets were not bound at their persisted short paths.\n' >&2; exit 1; }
 
 kill "$localhost_server" >/dev/null 2>&1 || true
 jit_cleanup_worker_state "$state_one"
 jit_cleanup_worker_state "$state_two"
 wait "$execute_one" >/dev/null 2>&1 || true; wait "$execute_two" >/dev/null 2>&1 || true
 ! id "$user_one" >/dev/null 2>&1 && ! id "$user_two" >/dev/null 2>&1
-[[ ! -e "$root_one" && ! -e "$root_two" ]]
+[[ ! -e "$root_one" && ! -e "$root_two" && ! -e "$runtime_one" && ! -e "$runtime_two" ]]
 if grep -qE "^(${user_one}|${user_two}):" /etc/subuid /etc/subgid; then
   printf 'Subordinate ID state survived normal worker cleanup.\n' >&2
   exit 1
@@ -170,21 +187,25 @@ fault_points=(
 fault_sequence=3
 for fault_point in "${fault_points[@]}"; do
   state_file="$(jit_worker_state_file "$JIT_ADMISSION_ID" "worker-$(printf '%03d' "$fault_sequence")")"
-  jit_write_worker_state "$state_file" allocated
-  jit_plan_worker_identity "$state_file" "$fault_sequence"
+  rm -f "$state_file"
   GHRCTL_JIT_FAULT_POINT="$fault_point"
-  if (jit_create_worker_boundary "$state_file"); then
-    printf 'Fault injection did not fire at %s.\n' "$fault_point" >&2
-    exit 1
-  fi
+  jit_spawn_worker "$fault_sequence"
   unset GHRCTL_JIT_FAULT_POINT
-  fault_user="$(jq -r .user "$state_file")"; fault_root="$(jq -r .root "$state_file")"
+  fault_pid="$(jq -r '.controller_pid // 0' "$state_file")"
+  [[ "$fault_pid" =~ ^[1-9][0-9]*$ ]] || { printf 'Real jit_worker_process did not publish a PID at %s.\n' "$fault_point" >&2; exit 1; }
+  for _attempt in $(seq 1 300); do
+    [[ "$(jq -r '.status // empty' "$state_file")" =~ ^(failed|finished|cleaned)$ ]] && break
+    sleep 0.1
+  done
+  wait "$fault_pid" >/dev/null 2>&1 || true
+  [[ "$(jq -r .status "$state_file")" == failed ]] || { printf 'Fault path did not terminate through jit_worker_process at %s.\n' "$fault_point" >&2; exit 1; }
+  fault_user="$(jq -r .user "$state_file")"; fault_root="$(jq -r .root "$state_file")"; fault_runtime="$(jq -r .runtime_dir "$state_file")"
   jit_cleanup_worker_state "$state_file"
   if id "$fault_user" >/dev/null 2>&1 || getent group "$fault_user" >/dev/null 2>&1 || grep -qE "^${fault_user}:" /etc/subuid /etc/subgid; then
     printf 'Identity state survived fault cleanup at %s.\n' "$fault_point" >&2
     exit 1
   fi
-  [[ ! -e "$fault_root" ]]
+  [[ ! -e "$fault_root" && ! -e "$fault_runtime" ]]
   fault_sequence=$((fault_sequence + 1))
 done
 

@@ -60,11 +60,15 @@ sudo ./ghrctl
 
 Do not make `curl | sudo bash` your default installation method.
 
-JIT mode requires the controller checkout to be staged by a root-owned
-installation contract under `/usr/local/lib/ghrctl/jit-runtime`. The transient
-worker keeps `ProtectHome=yes` and never executes helpers directly from a
-checkout under `/home` or `/root`; the root-owned controller stages and verifies
-the helper immediately before launching an admission worker.
+JIT mode requires the trusted controller to stage the sandbox helper once per
+admission, under a dedicated staging lock, using a root-owned installation
+contract at `/usr/local/lib/ghrctl/jit-runtime`. That immutable helper/manifest
+selection is persisted before any worker is spawned or registered, and workers
+only re-verify it. The transient worker keeps `ProtectHome=yes` and never
+executes helpers directly from a checkout under `/home` or `/root`.
+The controller also persists a deterministic path-and-SHA-256 manifest for all
+runtime-critical `libexec` files and holds a durable host-wide admission lease;
+another admission is rejected until the owner has completed recovery cleanup.
 
 ### Brand-new server
 

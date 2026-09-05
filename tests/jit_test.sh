@@ -262,6 +262,18 @@ fi
 JIT_ADMISSION_ID="$(find "$JIT_ADMISSIONS_DIR" -maxdepth 1 -type f -name '*.json' -printf '%f\n' | sed 's/\.json$//' | head -n1)"
 jit_load_admission "$JIT_ADMISSION_ID"
 
+# Staging uses explicit output parameters so controller state is not lost when
+# the helper is invoked from a subshell or a command substitution.
+staged_test_helper=""; staged_test_manifest=""
+jit_stage_runtime_helper staged_test_helper staged_test_manifest
+[[ "$staged_test_helper" == "$JIT_RUNTIME_HELPER" && "$staged_test_manifest" == "$JIT_RUNTIME_MANIFEST" ]] || fail "runtime staging output parameters were not propagated"
+[[ "$staged_test_manifest" == "$JIT_DATA_DIR/runtime/manifest.json" ]] || fail "fake runtime manifest path is not private and deterministic"
+jq -e --arg helper "$staged_test_helper" --arg helper_sha256 "$(sha256sum "$staged_test_helper" | awk '{print $1}')" '.helper==$helper and .helper_sha256==$helper_sha256' "$staged_test_manifest" >/dev/null || fail "runtime manifest does not bind the staged helper"
+short_runtime="$(jit_worker_runtime_dir "$JIT_ADMISSION_ID" worker-001 "$JIT_BOUNDARY_ROOT/$JIT_ADMISSION_ID/worker-001.boundary")"
+jit_assert_unix_socket_path "$short_runtime/docker.sock" || fail "worker Docker socket path exceeded AF_UNIX limits"
+long_socket="/tmp/$(printf 'x%.0s' $(seq 1 120))"
+if jit_assert_unix_socket_path "$long_socket"; then fail "overlong filesystem socket path was accepted"; fi
+
 JIT_TEST_CASE=target-page-2
 paginated_jobs="$(jit_get_run_jobs)"
 assert_eq "$(jit_target_jobs "$paginated_jobs" | jq length)" "2"
@@ -347,6 +359,7 @@ jit_spawn_worker 1
 wait "$(jq -r .controller_pid "$state_one")"
 assert_eq "$(jq -r .status "$state_one")" "finished"
 [[ ! -e "$(jq -r .root "$state_one")" ]] || fail "successful worker boundary survived cleanup"
+[[ ! -e "$(jq -r .runtime_dir "$state_one")" ]] || fail "successful worker runtime survived cleanup"
 diagnostics="${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/worker-001"
 [[ -r "$diagnostics/runner/runner.log" ]] || fail "external runner diagnostics were not retained"
 if grep -R -F 'jit-secret-material-123456' "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1; then fail "JIT secret leaked into state or diagnostics"; fi
@@ -355,12 +368,13 @@ if grep -q '^ACTIONS_RUNNER_INPUT_JITCONFIG=' "$diagnostics/runner/job-environme
 state_two="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-002)"
 state_three="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-003)"
 jit_write_worker_state "$state_two" allocated; jit_plan_worker_identity "$state_two" 2; jit_create_worker_boundary "$state_two"
-user_two="$JIT_WORKER_USER"; root_two="$JIT_WORKER_ROOT"; socket_two="$JIT_WORKER_DOCKER_SOCKET"
+user_two="$JIT_WORKER_USER"; root_two="$JIT_WORKER_ROOT"; runtime_two="$JIT_WORKER_RUNTIME_DIR"; socket_two="$JIT_WORKER_DOCKER_SOCKET"
 jit_write_worker_state "$state_three" allocated; jit_plan_worker_identity "$state_three" 3; jit_create_worker_boundary "$state_three"
-user_three="$JIT_WORKER_USER"; root_three="$JIT_WORKER_ROOT"; socket_three="$JIT_WORKER_DOCKER_SOCKET"
+user_three="$JIT_WORKER_USER"; root_three="$JIT_WORKER_ROOT"; runtime_three="$JIT_WORKER_RUNTIME_DIR"; socket_three="$JIT_WORKER_DOCKER_SOCKET"
 [[ "$user_two" != "$user_three" && "$root_two" != "$root_three" && "$socket_two" != "$socket_three" ]] || fail "simultaneous slots share an identity, filesystem, or Docker socket"
+[[ "$(jq -r .runtime_dir "$state_two")" != "$(jq -r .runtime_dir "$state_three")" ]] || fail "simultaneous slots share a runtime directory"
 jit_cleanup_worker_state "$state_two"; jit_cleanup_worker_state "$state_three"
-[[ ! -e "$root_two" && ! -e "$root_three" ]] || fail "cancel/restart cleanup left mutable worker state"
+[[ ! -e "$root_two" && ! -e "$root_three" && ! -e "$runtime_two" && ! -e "$runtime_three" ]] || fail "cancel/restart cleanup left mutable worker state"
 
 JIT_TEST_CASE=default-labels
 state_four="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-004)"
@@ -402,6 +416,80 @@ jit_cleanup_stale_worker_states "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
 assert_eq "$(jq -r .status "$state_seven")" "cleaned"
 [[ ! -e "$(jq -r .root "$state_seven")" ]] || fail "host-restart cleanup left mutable worker state"
 
+# A controller can disappear without leaving its global fd9 lock held by a
+# worker. The replacement process must acquire the lock and recover the stale
+# worker state deterministically.
+global_lock_was_held="$LOCK_HELD"
+abrupt_saved_admission_id="$JIT_ADMISSION_ID"
+JIT_ADMISSION_ID=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+mkdir -p "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
+if [[ "$global_lock_was_held" == 1 ]]; then
+  flock -u 9
+  exec 9>&-
+  LOCK_HELD=0
+fi
+GHRCTL_JIT_FAKE_RUNNER_ROOT="$ROOT/tests/fixtures/holding-actions-runner"
+jit_prepare_runner_cache
+abrupt_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-700)"
+(
+  acquire_lock
+  jit_spawn_worker 700
+  wait "$(jq -r '.controller_pid // 0' "$abrupt_state")" >/dev/null 2>&1 || true
+) & abrupt_controller_pid=$!
+abrupt_worker_pid=0
+for _attempt in $(seq 1 200); do
+  if [[ "$(jq -r '.status // empty' "$abrupt_state" 2>/dev/null)" == running ]]; then
+    abrupt_worker_pid="$(jq -r '.controller_pid // 0' "$abrupt_state")"
+    [[ "$abrupt_worker_pid" =~ ^[1-9][0-9]*$ ]] && break
+  fi
+  sleep 0.1
+done
+[[ "$abrupt_worker_pid" =~ ^[1-9][0-9]*$ ]] || fail "abrupt-controller worker did not reach running state"
+abrupt_boot_id="$(jq -r '.worker_boot_id // .controller_boot_id' "$abrupt_state")"
+abrupt_start_ticks="$(jq -r '.worker_start_ticks // .controller_start_ticks' "$abrupt_state")"
+[[ "$(jq -r .controller_process "$abrupt_state")" == jit_worker_process ]] || fail "worker journal did not identify the actual jit_worker_process"
+for _attempt in $(seq 1 100); do
+  [[ -r "$(jq -r .root "$abrupt_state")/home/actions-runner/_diag/runner.pid" ]] && break
+  sleep 0.1
+done
+abrupt_child_pid="$(cat "$(jq -r .root "$abrupt_state")/home/actions-runner/_diag/runner.pid")"
+[[ "$abrupt_child_pid" =~ ^[1-9][0-9]*$ ]] || fail "holding runner did not publish a descendant PID"
+kill -KILL "$abrupt_controller_pid" >/dev/null 2>&1 || true
+wait "$abrupt_controller_pid" >/dev/null 2>&1 || true
+exec {recovery_lock_fd}>"$GHRCTL_LOCK_FILE"
+flock -n "$recovery_lock_fd" || fail "global lock remained held after abrupt controller death"
+flock -u "$recovery_lock_fd"; exec {recovery_lock_fd}>&-
+# Kill the actual worker root as well. Recovery must use its durable descendant
+# journal rather than relying on the root process still being discoverable.
+kill -KILL "$abrupt_worker_pid" >/dev/null 2>&1 || true
+wait "$abrupt_worker_pid" >/dev/null 2>&1 || true
+jit_cleanup_admission_workers
+[[ "$(jq -r .status "$abrupt_state")" =~ ^(finished|cleaned)$ ]] || fail "abrupt-controller recovery did not reach a terminal cleanup state"
+assert_eq "$(jq 'length' "$JIT_TEST_REMOTE_RUNNERS_FILE")" 0
+[[ ! -e "$(jq -r .root "$abrupt_state")" ]] || fail "abrupt-controller worker boundary survived recovery cleanup"
+! jit_process_identity_active "$abrupt_worker_pid" "$abrupt_boot_id" "$abrupt_start_ticks" || fail "recovery cleanup left the actual worker process alive"
+[[ ! -e "/proc/$abrupt_child_pid" ]] || fail "recovery cleanup left a worker descendant alive"
+GHRCTL_JIT_FAKE_RUNNER_ROOT="$ROOT/tests/fixtures/fake-actions-runner"
+jit_prepare_runner_cache
+if [[ "$global_lock_was_held" == 1 ]]; then acquire_lock; fi
+JIT_ADMISSION_ID="$abrupt_saved_admission_id"
+jit_load_admission "$JIT_ADMISSION_ID"
+
+# A durable host lease blocks a second admission while the first is live, then
+# becomes eligible only after the owner records complete cleanup.
+lease_a="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+lease_b="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+jq --arg id "$lease_a" '.id=$id | .status="running" | .project="mazaya-test"' "$JIT_ADMISSION_FILE" | jit_atomic_write "$(jit_admission_file "$lease_a")"
+jq --arg id "$lease_b" '.id=$id | .status="prepared" | .project="mazaya-test"' "$JIT_ADMISSION_FILE" | jit_atomic_write "$(jit_admission_file "$lease_b")"
+jit_write_active_admission_lease "$lease_a" mazaya-test owner/repo
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "second admission bypassed the durable active-admission lease"; fi
+jq '.status="cleanup-pending"' "$(jit_admission_file "$lease_a")" | jit_atomic_write "$(jit_admission_file "$lease_a")"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "cleanup-pending admission did not block a second launch"; fi
+jq '.status="cleaned"' "$(jit_admission_file "$lease_a")" | jit_atomic_write "$(jit_admission_file "$lease_a")"
+jit_release_active_admission_lease "$lease_a"
+jit_assert_active_admission_available "$lease_b" || fail "second admission remained blocked after complete cleanup"
+rm -f "$(jit_admission_file "$lease_a")" "$(jit_admission_file "$lease_b")"
+
 saved_admission_id="$JIT_ADMISSION_ID"
 JIT_ADMISSION_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 mkdir -p "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
@@ -412,17 +500,25 @@ worker_fault_points=(
 fault_sequence=1
 for fault_point in "${worker_fault_points[@]}"; do
   fault_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" "worker-$(printf '%03d' "$fault_sequence")")"
-  jit_write_worker_state "$fault_state" allocated
-  jit_plan_worker_identity "$fault_state" "$fault_sequence"
+  rm -f "$fault_state"
   GHRCTL_JIT_FAULT_POINT="$fault_point"
-  if (jit_create_worker_boundary "$fault_state" >/dev/null 2>&1); then fail "worker fault injection did not fire: $fault_point"; fi
+  jit_spawn_worker "$fault_sequence"
   unset GHRCTL_JIT_FAULT_POINT
-  jq -e '.status=="creating" and .creation_stage!=null and .user!=null and .uid!=null and .group!=null and .root!=null and .home!=null and .docker_socket!=null' "$fault_state" >/dev/null \
+  fault_pid="$(jq -r '.controller_pid // 0' "$fault_state")"
+  [[ "$fault_pid" =~ ^[1-9][0-9]*$ ]] || fail "real jit_worker_process did not publish a controller PID: $fault_point"
+  for _attempt in $(seq 1 100); do
+    [[ "$(jq -r '.status // empty' "$fault_state")" =~ ^(failed|finished|cleaned)$ ]] && break
+    sleep 0.1
+  done
+  wait "$fault_pid" >/dev/null 2>&1 || true
+  assert_eq "$(jq -r .status "$fault_state")" failed
+  jq -e '.creation_stage!=null and .user!=null and .uid!=null and .group!=null and .root!=null and .home!=null and .runtime_dir!=null and .docker_socket!=null' "$fault_state" >/dev/null \
     || fail "partial worker identity was not journaled before fault: $fault_point"
   fault_root="$(jq -r .root "$fault_state")"
+  fault_runtime="$(jq -r .runtime_dir "$fault_state")"
   jit_cleanup_worker_state "$fault_state"
   assert_eq "$(jq -r .status "$fault_state")" "cleaned"
-  [[ ! -e "$fault_root" ]] || fail "partial worker boundary survived cleanup: $fault_point"
+  [[ ! -e "$fault_root" && ! -e "$fault_runtime" ]] || fail "partial worker boundary/runtime survived cleanup: $fault_point"
   fault_sequence=$((fault_sequence + 1))
 done
 
@@ -522,6 +618,23 @@ DRY_RUN=0
 JIT_TEST_CONTROLLER=1
 jit_launch_admission "$JIT_ADMISSION_ID" --slots 2 --auth test >/dev/null
 assert_eq "$(jq -r .status "$JIT_ADMISSION_FILE")" "completed"
+jq -e '.runtime_selection.helper and .runtime_selection.manifest and (.runtime_selection.helper_sha256|test("^[0-9a-f]{64}$")) and .runtime_selection.controller_revision and (.runtime_selection.controller_digest|test("^[0-9a-f]{64}$"))' "$JIT_ADMISSION_FILE" >/dev/null || fail "controller did not persist immutable runtime selection before spawning workers"
+first_runtime_helper="$(jq -r '.runtime_selection.helper' "$JIT_ADMISSION_FILE")"
+jq -s -e --arg helper "$first_runtime_helper" '[.[] | select(.sequence>=8) | .runtime_helper == $helper] | all' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json >/dev/null || fail "worker journal did not inherit the immutable runtime selection"
+jq -e '.runtime_selection.controller_manifest.files|length==6 and all(.[]; (.path|startswith("libexec/")) and (.sha256|test("^[0-9a-f]{64}$")))' "$JIT_ADMISSION_FILE" >/dev/null || fail "runtime provenance did not persist the deterministic libexec manifest"
+provenance_root="$TMP/runtime-provenance"
+mkdir -p "$provenance_root/libexec"
+while IFS= read -r provenance_file; do cp "$ROOT/libexec/$provenance_file" "$provenance_root/libexec/$provenance_file"; done < <(jit_runtime_critical_libexec_files)
+GHRCTL_JIT_PROVENANCE_ROOT="$provenance_root"
+jit_load_admission "$JIT_ADMISSION_ID"
+jit_validate_admission_runtime_selection || fail "unchanged runtime provenance failed validation"
+while IFS= read -r provenance_file; do
+  printf '# mutation\n' >>"$provenance_root/libexec/$provenance_file"
+  if jit_validate_admission_runtime_selection >/dev/null 2>&1; then fail "mutated runtime-critical libexec helper remained trusted: $provenance_file"; fi
+  cp "$ROOT/libexec/$provenance_file" "$provenance_root/libexec/$provenance_file"
+done < <(jit_runtime_critical_libexec_files)
+unset GHRCTL_JIT_PROVENANCE_ROOT
+jit_load_admission "$JIT_ADMISSION_ID"
 first_launch_count="$(find "$(jit_worker_state_dir "$JIT_ADMISSION_ID")" -maxdepth 1 -type f -name 'worker-*.json' | wc -l | tr -d ' ')"
 (( first_launch_count >= 10 && first_launch_count <= 20 )) || fail "controller replacement count escaped the configured bound"
 (( $(jq -s '[.[] | select((.sequence // 0) >= 8 and .status=="finished")] | length' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json) >= 3 )) || fail "controller did not finish all simulated jobs"

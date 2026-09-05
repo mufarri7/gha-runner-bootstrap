@@ -353,7 +353,7 @@ jit_prepare_admission() {
     --arg run_id "$JIT_ARG_RUN_ID" --arg run_attempt "$JIT_ARG_RUN_ATTEMPT" --arg pr_number "$JIT_ARG_PR_NUMBER" \
     --arg base_sha "$JIT_ARG_BASE_SHA" --arg head_sha "$JIT_ARG_HEAD_SHA" --arg merge_sha "$JIT_ARG_MERGE_SHA" --arg tree_sha "$JIT_ARG_TREE_SHA" --arg label "$JIT_ARG_LABEL" \
     --arg verified_at "$verified_at" --arg expires_epoch "$expires_epoch" --argjson verification "$verification" \
-    '{schema_version:$schema_version,id:$id,project:$project,repository:$repository,run_id:($run_id|tonumber),run_attempt:($run_attempt|tonumber),pr_number:($pr_number|tonumber),base_sha:$base_sha,head_sha:$head_sha,merge_sha:$merge_sha,tree_sha:$tree_sha,label:$label,status:"prepared",verified_at:$verified_at,expires_epoch:($expires_epoch|tonumber),consumed_at:null,completed_at:null,note:null,verification:$verification}' \
+    '{schema_version:$schema_version,id:$id,project:$project,repository:$repository,run_id:($run_id|tonumber),run_attempt:($run_attempt|tonumber),pr_number:($pr_number|tonumber),base_sha:$base_sha,head_sha:$head_sha,merge_sha:$merge_sha,tree_sha:$tree_sha,label:$label,status:"prepared",verified_at:$verified_at,expires_epoch:($expires_epoch|tonumber),consumed_at:null,completed_at:null,note:null,runtime_selection:null,verification:$verification}' \
     | jit_atomic_write "$admission_file"
   unset JIT_API_TOKEN
   if (( JSON_OUTPUT == 1 )); then jq . "$admission_file"; else success "Prepared verified admission: $admission_id"; fi
@@ -372,8 +372,143 @@ jit_load_admission() {
   JIT_ADMISSION_RUN_ID="$(jq -r .run_id "$file")"
   JIT_ADMISSION_RUN_ATTEMPT="$(jq -r .run_attempt "$file")"
   JIT_ADMISSION_LABEL="$(jq -r .label "$file")"
+  JIT_ADMISSION_RUNTIME_HELPER="$(jq -r '.runtime_selection.helper // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_MANIFEST="$(jq -r '.runtime_selection.manifest // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_HELPER_SHA256="$(jq -r '.runtime_selection.helper_sha256 // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_REVISION="$(jq -r '.runtime_selection.controller_revision // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST="$(jq -r '.runtime_selection.controller_digest // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST="$(jq -c '.runtime_selection.controller_manifest // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256="$(jq -r '.runtime_selection.controller_manifest_sha256 // empty' "$file")"
   jit_load_policy "$JIT_ADMISSION_PROJECT"
   [[ "$JIT_ADMISSION_REPOSITORY" == "$JIT_POLICY_REPOSITORY" ]] || die "Admission policy repository drift detected."
+}
+
+jit_persist_admission_runtime_selection() {
+  local helper="$1" manifest="$2" helper_sha256="$3" controller_revision="$4" controller_digest="$5" controller_manifest="${6:-}" controller_manifest_sha256="${7:-}"
+  [[ -n "$controller_manifest" ]] || controller_manifest="$(jit_runtime_controller_manifest_json)"
+  [[ -n "$controller_manifest_sha256" ]] || controller_manifest_sha256="$(printf '%s' "$controller_manifest" | sha256sum | awk '{print $1}')"
+  jq --arg helper "$helper" --arg manifest "$manifest" --arg helper_sha256 "$helper_sha256" \
+    --arg controller_revision "$controller_revision" --arg controller_digest "$controller_digest" --arg controller_manifest_sha256 "$controller_manifest_sha256" --argjson controller_manifest "$controller_manifest" --arg now "$(utc_now)" '
+    .runtime_selection={helper:$helper,manifest:$manifest,helper_sha256:$helper_sha256,controller_revision:$controller_revision,controller_digest:$controller_digest,controller_manifest:$controller_manifest,controller_manifest_sha256:$controller_manifest_sha256,staged_at:$now} |
+    .updated_at=$now
+  ' "$JIT_ADMISSION_FILE" | jit_atomic_write "$JIT_ADMISSION_FILE"
+  JIT_ADMISSION_RUNTIME_HELPER="$helper"
+  JIT_ADMISSION_RUNTIME_MANIFEST="$manifest"
+  JIT_ADMISSION_RUNTIME_HELPER_SHA256="$helper_sha256"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_REVISION="$controller_revision"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST="$controller_digest"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST="$controller_manifest"
+  JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256="$controller_manifest_sha256"
+}
+
+jit_admission_worker_state_is_live() {
+  local state_file="$1" status
+  [[ -r "$state_file" ]] || return 1
+  status="$(jq -r '.status // empty' "$state_file" 2>/dev/null || true)"
+  [[ "$status" =~ ^(allocated|creating|boundary-ready|registration-requested|registered|running|cleanup-pending)$ ]]
+}
+
+jit_admission_has_live_workers() {
+  local admission_id="$1" state_dir state_file
+  state_dir="$(jit_worker_state_dir "$admission_id")"
+  [[ -d "$state_dir" ]] || return 1
+  shopt -s nullglob
+  for state_file in "$state_dir"/worker-*.json; do
+    if jit_admission_worker_state_is_live "$state_file"; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+jit_admission_state_blocks_new_launch() {
+  local admission_file="$1" admission_id status
+  [[ -r "$admission_file" ]] || return 1
+  admission_id="$(jq -r '.id // empty' "$admission_file" 2>/dev/null || true)"
+  status="$(jq -r '.status // empty' "$admission_file" 2>/dev/null || true)"
+  [[ "$status" =~ ^(creating|registration-requested|registered|running|cancelled-with-live-workers|cleanup-pending)$ ]] && return 0
+  # Worker journals remain authoritative even if a controller persisted a
+  # terminal admission status immediately before it crashed.
+  jit_admission_has_live_workers "$admission_id"
+}
+
+jit_validate_admission_lease_state() {
+  local admission_file="$1"
+  jq -e --argjson schema "$JIT_SCHEMA_VERSION" '
+    .schema_version==$schema and (.id|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.status|type=="string" and test("^(prepared|creating|registration-requested|registered|running|cancelled|cancelled-with-live-workers|cleanup-pending|completed|failed|cleaned)$"))
+  ' "$admission_file" >/dev/null 2>&1
+}
+
+jit_active_admission_lease_is_valid() {
+  local lease="$JIT_ACTIVE_ADMISSION_LEASE_FILE"
+  [[ -r "$lease" ]] || return 1
+  jq -e --argjson schema "$JIT_SCHEMA_VERSION" '
+    .schema_version==$schema and (.state=="active" or .state=="released") and (.admission_id|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.project|type=="string" and length>0) and (.repository|type=="string" and length>2) and
+    (.pid|type=="number" and floor==. and .>=1) and (.boot_id|type=="string" and length>0) and
+    (.start_ticks|type=="number" and floor==. and .>=1)
+  ' "$lease" >/dev/null 2>&1
+}
+
+jit_write_active_admission_lease() {
+  local admission_id="$1" project="$2" repository="$3" now pid boot_id start_ticks
+  pid="${BASHPID:-$$}"
+  boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)"
+  start_ticks="$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || printf 1)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$start_ticks" =~ ^[1-9][0-9]*$ ]] || die "Unable to journal the active admission lease owner."
+  now="$(utc_now)"
+  jq -n --argjson schema "$JIT_SCHEMA_VERSION" --arg state active --arg admission_id "$admission_id" --arg project "$project" --arg repository "$repository" \
+    --arg pid "$pid" --arg boot_id "$boot_id" --arg start_ticks "$start_ticks" --arg acquired_at "$now" --arg updated_at "$now" \
+    '{schema_version:$schema,state:$state,admission_id:$admission_id,project:$project,repository:$repository,pid:($pid|tonumber),boot_id:$boot_id,start_ticks:($start_ticks|tonumber),acquired_at:$acquired_at,updated_at:$updated_at}' \
+    | jit_atomic_write "$JIT_ACTIVE_ADMISSION_LEASE_FILE"
+}
+
+jit_release_active_admission_lease() {
+  local admission_id="${1:-}" now current
+  [[ -r "$JIT_ACTIVE_ADMISSION_LEASE_FILE" ]] || return 0
+  current="$(jq -r '.admission_id // empty' "$JIT_ACTIVE_ADMISSION_LEASE_FILE" 2>/dev/null || true)"
+  [[ -z "$admission_id" || "$current" == "$admission_id" ]] || return 0
+  now="$(utc_now)"
+  jq --arg state released --arg now "$now" '.state=$state | .released_at=$now | .updated_at=$now' "$JIT_ACTIVE_ADMISSION_LEASE_FILE" | jit_atomic_write "$JIT_ACTIVE_ADMISSION_LEASE_FILE"
+}
+
+jit_assert_active_admission_available() {
+  local requested_id="$1" state_file state_id lease_id lease_state found=0
+  if [[ -e "$JIT_ACTIVE_ADMISSION_LEASE_FILE" ]]; then
+    jit_active_admission_lease_is_valid || die "The active-admission lease is malformed; recovery is required before another launch."
+    lease_state="$(jq -r .state "$JIT_ACTIVE_ADMISSION_LEASE_FILE")"
+    lease_id="$(jq -r .admission_id "$JIT_ACTIVE_ADMISSION_LEASE_FILE")"
+    if [[ "$lease_state" == active && "$lease_id" != "$requested_id" ]]; then
+      [[ -r "$(jit_admission_file "$lease_id")" ]] || die "Active-admission lease owner state is missing; recovery is required before another launch."
+      if jit_admission_state_blocks_new_launch "$(jit_admission_file "$lease_id")"; then
+        die "Another admission is active ($lease_id); resume or clean it before launching $requested_id."
+      fi
+      # A released or terminal lease is retained as durable history and can be
+      # replaced by the next owner under the global CLI lock.
+      jit_release_active_admission_lease "$lease_id"
+    fi
+  fi
+  shopt -s nullglob
+  for state_file in "$JIT_ADMISSIONS_DIR"/*.json; do
+    jit_validate_admission_lease_state "$state_file" || die "Admission journal is malformed; recovery is required before another launch: $state_file"
+    state_id="$(jq -r '.id // empty' "$state_file" 2>/dev/null || true)"
+    [[ -n "$state_id" && "$state_id" != "$requested_id" ]] || continue
+    if jit_admission_state_blocks_new_launch "$state_file"; then
+      found=1
+      break
+    fi
+  done
+  shopt -u nullglob
+  (( found == 0 )) || die "Another admission has live or cleanup-pending workers; launch is fail-closed until it is recovered."
+}
+
+jit_acquire_active_admission_lease() {
+  local admission_id="$1" project="$2" repository="$3"
+  jit_assert_active_admission_available "$admission_id"
+  jit_write_active_admission_lease "$admission_id" "$project" "$repository"
 }
 
 jit_set_admission_status() {
