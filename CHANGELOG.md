@@ -16,6 +16,9 @@ The project follows semantic versioning after `1.0.0`. Pre-1.0 beta versions may
 - Immutable run-attempt/job-bound admission artifacts with SHA-256 and safe-archive validation; UI summaries and logs are not trusted evidence.
 - Complete fail-closed pagination, write-ahead resumable quarantine journals, and deterministic pre-mutation worker identity checkpoints.
 - Durable critical-state replacement and pre-request JIT registration intent with exact-name/exact-label orphan reconciliation.
+- PID-reuse-safe process cleanup with persisted sandbox MainPID/slirp identities and systemd/cgroup-first production teardown.
+- Strict worker-journal launch gating plus stale-admission unit, runtime-path, and exact-label remote-runner reconciliation.
+- Root-locked host/project diagnostic quotas, minimum-free-space preflight, deterministic TTL/count pruning, and failure-evidence preference.
 - Corrected `mazaya-backend` policy with case-insensitive project-derived reusable-label quarantine.
 - Fake lifecycle/security tests plus a guarded Ubuntu 24.04 destructive test and pre-stable validation plan.
 

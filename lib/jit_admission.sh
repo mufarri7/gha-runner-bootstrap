@@ -402,10 +402,57 @@ jit_persist_admission_runtime_selection() {
 }
 
 jit_admission_worker_state_is_live() {
-  local state_file="$1" status
-  [[ -r "$state_file" ]] || return 1
-  status="$(jq -r '.status // empty' "$state_file" 2>/dev/null || true)"
+  local state_file="$1" admission_id="${2:-}" status
+  [[ -n "$admission_id" ]] || admission_id="$(basename -- "$(dirname -- "$state_file")")"
+  jit_validate_worker_journal "$state_file" "$admission_id" || die "Worker journal is malformed or deterministically invalid; recovery is required before another launch: $state_file"
+  status="$(jq -r '.status' "$state_file")"
   [[ "$status" =~ ^(allocated|creating|boundary-ready|registration-requested|registered|running|cleanup-pending)$ ]]
+}
+
+jit_validate_worker_journal() {
+  local state_file="$1" expected_admission="$2" expected_worker
+  [[ -r "$state_file" && "$expected_admission" =~ ^[0-9a-f]{64}$ ]] || return 1
+  expected_worker="$(basename -- "$state_file" .json)"
+  [[ "$expected_worker" =~ ^worker-[0-9]{3,}$ ]] || return 1
+  jq -e --argjson schema "$JIT_SCHEMA_VERSION" --arg admission "$expected_admission" --arg worker "$expected_worker" '
+    .schema_version==$schema and .admission_id==$admission and .worker_id==$worker and
+    (.sequence|type=="number" and floor==. and .>=1) and
+    (.status|type=="string" and test("^(allocated|creating|boundary-ready|registration-requested|registered|running|cancelled|cleanup-pending|cleaned|finished|failed)$")) and
+    (.controller_children|type=="array" and all(.[];
+      (.pid|type=="number" and floor==. and .>=1) and
+      (.boot_id|type=="string" and length>0) and
+      (.start_ticks|type=="number" and floor==. and .>=1))) and
+    ((.sandbox_main_pid==null and .sandbox_main_boot_id==null and .sandbox_main_start_ticks==null) or
+      ((.sandbox_main_pid|type=="number" and floor==. and .>=1) and
+       (.sandbox_main_boot_id|type=="string" and length>0) and
+       (.sandbox_main_start_ticks|type=="number" and floor==. and .>=1))) and
+    ((.sandbox_slirp_pid==null and .sandbox_slirp_boot_id==null and .sandbox_slirp_start_ticks==null) or
+      ((.sandbox_slirp_pid|type=="number" and floor==. and .>=1) and
+       (.sandbox_slirp_boot_id|type=="string" and length>0) and
+       (.sandbox_slirp_start_ticks|type=="number" and floor==. and .>=1)))
+  ' "$state_file" >/dev/null 2>&1 || return 1
+  (jit_validate_worker_identity_state "$state_file" >/dev/null 2>&1)
+}
+
+jit_validate_all_worker_journals() {
+  local state_dir state_file admission_id
+  [[ -d "$JIT_WORKERS_DIR" ]] || return 0
+  shopt -s nullglob
+  for state_dir in "$JIT_WORKERS_DIR"/*; do
+    [[ -d "$state_dir" ]] || continue
+    admission_id="$(basename -- "$state_dir")"
+    [[ "$admission_id" =~ ^[0-9a-f]{64}$ && -r "$(jit_admission_file "$admission_id")" ]] || {
+      shopt -u nullglob
+      return 1
+    }
+    for state_file in "$state_dir"/worker-*.json; do
+      jit_validate_worker_journal "$state_file" "$admission_id" || {
+        shopt -u nullglob
+        return 1
+      }
+    done
+  done
+  shopt -u nullglob
 }
 
 jit_admission_has_live_workers() {
@@ -414,7 +461,7 @@ jit_admission_has_live_workers() {
   [[ -d "$state_dir" ]] || return 1
   shopt -s nullglob
   for state_file in "$state_dir"/worker-*.json; do
-    if jit_admission_worker_state_is_live "$state_file"; then
+    if jit_admission_worker_state_is_live "$state_file" "$admission_id"; then
       shopt -u nullglob
       return 0
     fi
@@ -435,11 +482,64 @@ jit_admission_state_blocks_new_launch() {
 }
 
 jit_validate_admission_lease_state() {
-  local admission_file="$1"
-  jq -e --argjson schema "$JIT_SCHEMA_VERSION" '
-    .schema_version==$schema and (.id|type=="string" and test("^[0-9a-f]{64}$")) and
+  local admission_file="$1" expected_id
+  expected_id="$(basename -- "$admission_file" .json)"
+  jq -e --argjson schema "$JIT_SCHEMA_VERSION" --arg expected_id "$expected_id" '
+    .schema_version==$schema and .id==$expected_id and (.id|type=="string" and test("^[0-9a-f]{64}$")) and
+    (.project|type=="string" and test("^[a-z0-9][a-z0-9-]*$")) and
+    (.repository|type=="string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
+    (.label|type=="string" and test("^[a-z0-9][a-z0-9-]*$")) and
     (.status|type=="string" and test("^(prepared|creating|registration-requested|registered|running|cancelled|cancelled-with-live-workers|cleanup-pending|completed|failed|cleaned)$"))
   ' "$admission_file" >/dev/null 2>&1
+}
+
+jit_admission_has_deterministic_units() {
+  local admission_id="$1" prefix units
+  prefix="ghrctl-jit-${admission_id:0:12}-"
+  if jit_test_backend_enabled; then
+    [[ -n "${GHRCTL_JIT_FAKE_UNITS_DIR:-}" && -d "$GHRCTL_JIT_FAKE_UNITS_DIR" ]] || return 1
+    compgen -G "${GHRCTL_JIT_FAKE_UNITS_DIR}/${prefix}*.service" >/dev/null
+    return
+  fi
+  units="$(systemctl list-units --all --plain --no-legend "${prefix}*.service" 2>/dev/null)" || return 0
+  [[ -n "$units" ]]
+}
+
+jit_admission_has_runtime_paths() {
+  local admission_id="$1" boundary_dir runtime_path runtime_root
+  boundary_dir="${JIT_BOUNDARY_ROOT}/${admission_id}"
+  if [[ -d "$boundary_dir" ]] && find "$boundary_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    return 0
+  fi
+  runtime_root="$JIT_WORKER_RUNTIME_ROOT"
+  jit_test_backend_enabled && runtime_root="${JIT_DATA_DIR}/worker-runtime"
+  shopt -s nullglob
+  for runtime_path in "${runtime_root}/${admission_id:0:12}-"*; do
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+jit_admission_has_exact_label_runner() {
+  local repository="$1" label="$2" runners
+  runners="$(jit_api_collection "repos/${repository}/actions/runners" runners)"
+  jq -e 'all(.runners[]; (.labels|type=="array") and all(.labels[]; (.name|type=="string")))' >/dev/null <<<"$runners" \
+    || die "GitHub returned malformed runner labels while reconciling a stale admission."
+  jq -e --arg label "$label" '.runners | any(.labels | any(.name==$label))' >/dev/null <<<"$runners"
+}
+
+jit_reconcile_inactive_admission() {
+  local admission_file="$1" admission_id repository label
+  admission_id="$(jq -r .id "$admission_file")"
+  repository="$(jq -r .repository "$admission_file")"
+  label="$(jq -r .label "$admission_file")"
+  jit_admission_has_live_workers "$admission_id" && return 1
+  jit_admission_has_deterministic_units "$admission_id" && return 1
+  jit_admission_has_runtime_paths "$admission_id" && return 1
+  jit_admission_has_exact_label_runner "$repository" "$label" && return 1
+  return 0
 }
 
 jit_active_admission_lease_is_valid() {
@@ -457,7 +557,7 @@ jit_write_active_admission_lease() {
   local admission_id="$1" project="$2" repository="$3" now pid boot_id start_ticks
   pid="${BASHPID:-$$}"
   boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)"
-  start_ticks="$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || printf 1)"
+  start_ticks="$(jit_process_start_ticks "$pid" 2>/dev/null || printf 1)"
   [[ "$pid" =~ ^[1-9][0-9]*$ && "$start_ticks" =~ ^[1-9][0-9]*$ ]] || die "Unable to journal the active admission lease owner."
   now="$(utc_now)"
   jq -n --argjson schema "$JIT_SCHEMA_VERSION" --arg state active --arg admission_id "$admission_id" --arg project "$project" --arg repository "$repository" \
@@ -477,15 +577,20 @@ jit_release_active_admission_lease() {
 
 jit_assert_active_admission_available() {
   local requested_id="$1" state_file state_id lease_id lease_state found=0
+  jit_validate_all_worker_journals || die "A worker journal is malformed, orphaned, or deterministically invalid; recovery is required before another launch."
   if [[ -e "$JIT_ACTIVE_ADMISSION_LEASE_FILE" ]]; then
     jit_active_admission_lease_is_valid || die "The active-admission lease is malformed; recovery is required before another launch."
     lease_state="$(jq -r .state "$JIT_ACTIVE_ADMISSION_LEASE_FILE")"
     lease_id="$(jq -r .admission_id "$JIT_ACTIVE_ADMISSION_LEASE_FILE")"
     if [[ "$lease_state" == active && "$lease_id" != "$requested_id" ]]; then
       [[ -r "$(jit_admission_file "$lease_id")" ]] || die "Active-admission lease owner state is missing; recovery is required before another launch."
+      jit_validate_admission_lease_state "$(jit_admission_file "$lease_id")" \
+        || die "Active-admission lease owner journal is malformed; recovery is required before another launch."
       if jit_admission_state_blocks_new_launch "$(jit_admission_file "$lease_id")"; then
         die "Another admission is active ($lease_id); resume or clean it before launching $requested_id."
       fi
+      jit_reconcile_inactive_admission "$(jit_admission_file "$lease_id")" \
+        || die "The stale admission still owns a deterministic unit, runtime path, or exact-label remote runner: $lease_id"
       # A released or terminal lease is retained as durable history and can be
       # replaced by the next owner under the global CLI lock.
       jit_release_active_admission_lease "$lease_id"
@@ -500,6 +605,10 @@ jit_assert_active_admission_available() {
       found=1
       break
     fi
+    jit_reconcile_inactive_admission "$state_file" || {
+      found=1
+      break
+    }
   done
   shopt -u nullglob
   (( found == 0 )) || die "Another admission has live or cleanup-pending workers; launch is fail-closed until it is recovered."

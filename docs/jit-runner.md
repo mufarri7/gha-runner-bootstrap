@@ -100,6 +100,13 @@ registered, running, cancelled with live workers, or cleanup-pending. The lease
 is retained as a released record for restart evidence and is released only
 after complete worker cleanup; recovery therefore permits `resume`, `cleanup`,
 or rollback of the owning admission but never an overlapping launch.
+Every existing worker journal is parsed against the current schema, known
+status set, and deterministic user/unit/path identity before that decision.
+Malformed, truncated, unsupported-schema, unknown-status, orphaned, or
+identity-invalid journals block launch. Before a terminal lease can be
+replaced, the controller also proves that its deterministic systemd units,
+boundary/runtime paths, and complete paginated exact-label remote-runner
+inventory are empty.
 
 ## Clean worker boundary
 
@@ -123,7 +130,7 @@ to the `ProtectHome=yes` worker and is never the executable path passed to the
 unit.
 
 Each production worker receives a short private runtime directory at
-`/run/ghrctl-jit/<16-hex-id>` and its Docker socket is exactly
+`/run/ghrctl-jit/<12-hex-admission-prefix>-<worker-sequence>` and its Docker socket is exactly
 `<runtime>/docker.sock`. The runtime path is persisted, canonical, validated to
 remain outside protected homes, and checked to be below Linux's 108-byte
 `AF_UNIX` filesystem-socket limit before launch. It is removed independently on
@@ -135,8 +142,12 @@ Before the first host mutation, the controller durably journals the exact
 the deterministic worker user, group, UID/GID, exact subordinate UID/GID ranges,
 both configured pool snapshots, boundary paths, sandbox unit, and Docker
 socket. The worker itself owns the host-mutation lock; no background wrapper is
-tracked. Recovery walks and verifies the complete recorded process tree,
-terminating descendants before identity/runtime teardown. Creation checkpoints
+tracked. Production teardown stops and verifies the deterministic transient
+systemd units/cgroups first. Recovery traverses current descendants only while
+the persisted root PID, boot ID, and start ticks match both before and after the
+snapshot; a stale or reused root grants no traversal authority. Sandbox MainPID
+and slirp PID, boot ID, and start ticks are persisted independently and are
+never reconstructed from current `/proc` metadata. Creation checkpoints
 the boundary, group, user, subordinate IDs, runner seed, and sandbox preparation.
 The allocator parses every record in `/etc/passwd`, `/etc/group`, `/etc/subuid`,
 and `/etc/subgid`; malformed, overlapping, occupied, or cross-pool maps fail
@@ -152,6 +163,21 @@ The runner and its dedicated Rootless Docker daemon execute in one transient sys
 PATH entries must resolve to root-owned, non-group/world-writable directories. Rootful Docker services and `/var/run/docker.sock` are forbidden.
 
 Controller and unit output is drained directly into a root-created file capped at 4 MiB. On every exit path, the sandbox unit, Rootless Docker daemon, network helper, and all worker-UID processes are terminated and verified absent before `_diag` is inspected. The collector opens the canonical in-boundary source with no-follow file descriptors; it rejects top-level or nested symlinks, mount crossings, special files, hard links, sparse files, and concurrent metadata changes. It retains at most 200 regular files, 4 MiB per file, and 32 MiB aggregate, using a fresh root-only destination. Collection failure is fail-closed and leaves cleanup pending rather than copying an unsafe tree as root.
+
+Host-wide retention is serialized by the root-only
+`/var/lib/ghrctl/jit/diagnostics-retention.lock`. Each worker reserves its
+maximum 36 MiB controller/runner allowance before execution. Deterministic
+pruning enforces a 4 GiB host quota, 1 GiB per-project quota, 2 GiB minimum free
+space, 14-day TTL, and 100 retained workers per project by default. Successful
+evidence is pruned before failure/cancellation/cleanup-pending evidence; active
+reservations and malformed retention metadata are never pruned automatically.
+Operators may set `GHRCTL_JIT_DIAGNOSTIC_HOST_MAX_BYTES`,
+`GHRCTL_JIT_DIAGNOSTIC_PROJECT_MAX_BYTES`,
+`GHRCTL_JIT_DIAGNOSTIC_MIN_FREE_BYTES`,
+`GHRCTL_JIT_DIAGNOSTIC_RETENTION_SECONDS`, and
+`GHRCTL_JIT_DIAGNOSTIC_PROJECT_MAX_WORKERS` before invoking `ghrctl`. An
+unsatisfied reservation, quota, or free-space floor fails closed before worker
+execution.
 
 Before `generate-jitconfig`, the worker journal records `registration-requested` with deterministic runner name, exact admission label, admission ID, and request identity. After a timeout, process death, or reboot, cleanup scans the complete paginated runner inventory by exact name. One non-busy runner with exactly the admission label is deleted as an orphan; zero is accepted after bounded stable observation; duplicate, mismatched, or busy results fail closed. The create response must report the expected offline/non-busy identity with one custom label; one-job ephemerality comes from GitHub's JIT-config endpoint contract. The local boundary is then deleted and the recorded runner ID is deregistered if present.
 

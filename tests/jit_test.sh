@@ -4,7 +4,8 @@ export GHRCTL_TEST_MODE=1
 export GHRCTL_JIT_HOST_BACKEND=fake
 export GHRCTL_JIT_FAKE_RUNNER_ROOT="$ROOT/tests/fixtures/fake-actions-runner"
 export GHRCTL_JIT_FAKE_SERVICES_DIR="$TMP/fake-services"
-mkdir -p "$GHRCTL_JIT_FAKE_SERVICES_DIR"
+export GHRCTL_JIT_FAKE_UNITS_DIR="$TMP/fake-jit-units"
+mkdir -p "$GHRCTL_JIT_FAKE_SERVICES_DIR" "$GHRCTL_JIT_FAKE_UNITS_DIR"
 JIT_TEST_REMOTE_RUNNERS_FILE="$TMP/fake-remote-runners.json"
 printf '[]\n' >"$JIT_TEST_REMOTE_RUNNERS_FILE"
 
@@ -211,6 +212,8 @@ jit_api() {
         else
           jq -cn --arg label "$JIT_TEST_LABEL" '{total_count:101,runners:[{id:7001,name:"jit",status:"offline",busy:false,ephemeral:true,labels:[{name:$label}]}]}'
         fi
+      elif [[ "$JIT_TEST_CASE" == stale-exact-label ]]; then
+        jq -cn --arg label "$JIT_TEST_LABEL" '{total_count:1,runners:[{id:73,name:"stale-jit",status:"offline",busy:false,ephemeral:true,labels:[{name:$label}]}]}'
       elif [[ "$JIT_TEST_CASE" == forbidden-runner || -e "$GHRCTL_JIT_FAKE_SERVICES_DIR/actions.runner.fixture.service.active" ]]; then
         jq -cn '{total_count:1,runners:[{id:41,name:"persistent",status:"online",busy:false,ephemeral:false,labels:[{name:"self-hosted"},{name:"Linux"},{name:"X64"},{name:"fixture-ci"},{name:"shared-ci"}]}]}'
       else
@@ -351,6 +354,45 @@ mkdir "$diagnostic_boundary/aggregate"; for diagnostic_index in $(seq 1 9); do d
 diagnostic_reject outside-boundary /etc
 rm -rf --one-file-system "$diagnostic_boundary"
 
+# Project/host retention is serialized by a root-only lock and prunes
+# successful evidence before older failure evidence.
+retention_root="$TMP/retention-policy"
+mkdir -p "$retention_root/admission-a/worker-failed" "$retention_root/admission-b/worker-success"
+printf failure >"$retention_root/admission-a/worker-failed/evidence.log"
+printf success >"$retention_root/admission-b/worker-success/evidence.log"
+jit_write_diagnostic_retention_marker "$retention_root/admission-a/worker-failed" mazaya-test admission-a worker-failed failed 0
+jit_write_diagnostic_retention_marker "$retention_root/admission-b/worker-success" mazaya-test admission-b worker-success finished 0
+python3 "$ROOT/libexec/prune_diagnostics.py" --root "$retention_root" --project mazaya-test \
+  --host-max-bytes 1048576 --project-max-bytes 1048576 --min-free-bytes 0 --retention-seconds 86400 \
+  --project-max-workers 1 --now-epoch "$(date +%s)"
+[[ -d "$retention_root/admission-a/worker-failed" && ! -e "$retention_root/admission-b/worker-success" ]] \
+  || fail "diagnostic pruning did not preserve failure evidence preferentially"
+if python3 "$ROOT/libexec/prune_diagnostics.py" --root "$TMP/retention-no-space" --project mazaya-test \
+  --host-max-bytes 1048576 --project-max-bytes 1048576 --min-free-bytes 999999999999999999 \
+  --retention-seconds 86400 --project-max-workers 1 --reserve-bytes 1 --reserve-workers 1 >/dev/null 2>&1; then
+  fail "diagnostic minimum-free-space guard failed open"
+fi
+if python3 "$ROOT/libexec/prune_diagnostics.py" --root "$TMP/retention-no-project-quota" --project mazaya-test \
+  --host-max-bytes 4096 --project-max-bytes 1024 --min-free-bytes 0 \
+  --retention-seconds 86400 --project-max-workers 1 --reserve-bytes 2048 --reserve-workers 1 >/dev/null 2>&1; then
+  fail "diagnostic project quota failed open"
+fi
+if python3 "$ROOT/libexec/prune_diagnostics.py" --root "$TMP/retention-no-host-quota" --project mazaya-test \
+  --host-max-bytes 1024 --project-max-bytes 4096 --min-free-bytes 0 \
+  --retention-seconds 86400 --project-max-workers 1 --reserve-bytes 2048 --reserve-workers 1 >/dev/null 2>&1; then
+  fail "diagnostic host quota failed open"
+fi
+mkdir -p "$retention_root/admission-c/worker-expired"
+jit_write_diagnostic_retention_marker "$retention_root/admission-c/worker-expired" mazaya-test admission-c worker-expired finished 0
+jq '.created_epoch=1' "$retention_root/admission-c/worker-expired/.retention.json" | jit_atomic_write "$retention_root/admission-c/worker-expired/.retention.json"
+python3 "$ROOT/libexec/prune_diagnostics.py" --root "$retention_root" --project mazaya-test \
+  --host-max-bytes 1048576 --project-max-bytes 1048576 --min-free-bytes 0 --retention-seconds 1 \
+  --project-max-workers 100 --now-epoch "$(date +%s)"
+[[ ! -e "$retention_root/admission-c/worker-expired" ]] || fail "diagnostic TTL pruning failed"
+jit_acquire_diagnostic_retention_lock retention_test_fd
+assert_eq "$(stat -c '%a' "$JIT_DIAGNOSTIC_RETENTION_LOCK_FILE")" 600
+jit_release_diagnostic_retention_lock "$retention_test_fd"
+
 jit_prepare_runner_cache
 state_dir="$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
 mkdir -p "$state_dir"
@@ -375,6 +417,45 @@ user_three="$JIT_WORKER_USER"; root_three="$JIT_WORKER_ROOT"; runtime_three="$JI
 [[ "$(jq -r .runtime_dir "$state_two")" != "$(jq -r .runtime_dir "$state_three")" ]] || fail "simultaneous slots share a runtime directory"
 jit_cleanup_worker_state "$state_two"; jit_cleanup_worker_state "$state_three"
 [[ ! -e "$root_two" && ! -e "$root_three" && ! -e "$runtime_two" && ! -e "$runtime_three" ]] || fail "cancel/restart cleanup left mutable worker state"
+
+# Same-boot PID reuse must not authorize traversal or signalling of an unrelated
+# root, sandbox MainPID, slirp process, or any of their current children.
+reuse_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-850)"
+jit_write_worker_state "$reuse_state" allocated
+jit_plan_worker_identity "$reuse_state" 850
+reuse_pids=()
+spawn_reused_process_tree() {
+  local child_file="$1" output_parent="$2" output_child="$3" parent child
+  /bin/bash -c 'sleep 300 & printf "%s\n" "$!" >"$1"; wait' reused-tree "$child_file" &
+  parent=$!
+  for _attempt in $(seq 1 100); do [[ -s "$child_file" ]] && break; sleep 0.01; done
+  child="$(cat "$child_file")"
+  [[ "$parent" =~ ^[1-9][0-9]*$ && "$child" =~ ^[1-9][0-9]*$ ]] || fail "PID-reuse fixture did not publish a process tree"
+  printf -v "$output_parent" '%s' "$parent"
+  printf -v "$output_child" '%s' "$child"
+  reuse_pids+=("$parent" "$child")
+}
+spawn_reused_process_tree "$TMP/reuse-root-child" reuse_root reuse_root_child
+spawn_reused_process_tree "$TMP/reuse-main-child" reuse_main reuse_main_child
+spawn_reused_process_tree "$TMP/reuse-slirp-child" reuse_slirp reuse_slirp_child
+trap 'kill -TERM "${reuse_pids[@]}" >/dev/null 2>&1 || true; rm -rf "$TMP"' EXIT
+reuse_boot="$(cat /proc/sys/kernel/random/boot_id)"
+reuse_root_ticks="$(( $(jit_process_start_ticks "$reuse_root") + 1 ))"
+reuse_main_ticks="$(( $(jit_process_start_ticks "$reuse_main") + 1 ))"
+reuse_slirp_ticks="$(( $(jit_process_start_ticks "$reuse_slirp") + 1 ))"
+jq --arg root "$reuse_root" --arg main "$reuse_main" --arg slirp "$reuse_slirp" --arg boot "$reuse_boot" \
+  --arg root_ticks "$reuse_root_ticks" --arg main_ticks "$reuse_main_ticks" --arg slirp_ticks "$reuse_slirp_ticks" '
+  .controller_pid=($root|tonumber) | .controller_boot_id=$boot | .controller_start_ticks=($root_ticks|tonumber) |
+  .worker_pid=($root|tonumber) | .worker_boot_id=$boot | .worker_start_ticks=($root_ticks|tonumber) |
+  .sandbox_main_pid=($main|tonumber) | .sandbox_main_boot_id=$boot | .sandbox_main_start_ticks=($main_ticks|tonumber) |
+  .sandbox_slirp_pid=($slirp|tonumber) | .sandbox_slirp_boot_id=$boot | .sandbox_slirp_start_ticks=($slirp_ticks|tonumber)
+' "$reuse_state" | jit_atomic_write "$reuse_state"
+jit_terminate_worker_tree "$reuse_state"
+for reuse_pid in "${reuse_pids[@]}"; do kill -0 "$reuse_pid" 2>/dev/null || fail "stale persisted PID signalled an unrelated reused process or child: $reuse_pid"; done
+kill -TERM "${reuse_pids[@]}" >/dev/null 2>&1 || true
+wait "$reuse_root" "$reuse_main" "$reuse_slirp" >/dev/null 2>&1 || true
+trap 'rm -rf "$TMP"' EXIT
+rm -f "$reuse_state"
 
 JIT_TEST_CASE=default-labels
 state_four="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-004)"
@@ -422,6 +503,7 @@ assert_eq "$(jq -r .status "$state_seven")" "cleaned"
 global_lock_was_held="$LOCK_HELD"
 abrupt_saved_admission_id="$JIT_ADMISSION_ID"
 JIT_ADMISSION_ID=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+jq --arg id "$JIT_ADMISSION_ID" '.id=$id | .status="cleaned"' "$(jit_admission_file "$abrupt_saved_admission_id")" | jit_atomic_write "$(jit_admission_file "$JIT_ADMISSION_ID")"
 mkdir -p "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
 if [[ "$global_lock_was_held" == 1 ]]; then
   flock -u 9
@@ -477,6 +559,7 @@ jit_load_admission "$JIT_ADMISSION_ID"
 
 # A durable host lease blocks a second admission while the first is live, then
 # becomes eligible only after the owner records complete cleanup.
+lease_saved_admission_id="$JIT_ADMISSION_ID"
 lease_a="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 lease_b="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 jq --arg id "$lease_a" '.id=$id | .status="running" | .project="mazaya-test"' "$JIT_ADMISSION_FILE" | jit_atomic_write "$(jit_admission_file "$lease_a")"
@@ -488,10 +571,53 @@ if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail
 jq '.status="cleaned"' "$(jit_admission_file "$lease_a")" | jit_atomic_write "$(jit_admission_file "$lease_a")"
 jit_release_active_admission_lease "$lease_a"
 jit_assert_active_admission_available "$lease_b" || fail "second admission remained blocked after complete cleanup"
+
+# Every persisted worker journal is a launch gate. Truncation, schema drift,
+# unknown status, or a non-deterministic identity must fail closed.
+JIT_ADMISSION_ID="$lease_a"
+lease_worker="$(jit_worker_state_file "$lease_a" worker-901)"
+jit_write_worker_state "$lease_worker" allocated
+jit_plan_worker_identity "$lease_worker" 901
+valid_lease_worker="$(cat "$lease_worker")"
+printf '{"schema_version":' >"$lease_worker"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "truncated worker journal failed open"; fi
+printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
+jq '.schema_version=999' "$lease_worker" | jit_atomic_write "$lease_worker"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "unknown worker journal schema failed open"; fi
+printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
+jq '.status="future-status"' "$lease_worker" | jit_atomic_write "$lease_worker"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "unknown worker journal status failed open"; fi
+printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
+jq '.sandbox_unit="attacker-selected.service"' "$lease_worker" | jit_atomic_write "$lease_worker"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "invalid deterministic worker identity failed open"; fi
+printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
+jq '.root=null' "$lease_worker" | jit_atomic_write "$lease_worker"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "missing required worker identity failed open"; fi
+rm -f "$lease_worker"
+
+# A terminal journal cannot release/replace its lease while deterministic host
+# or exact-label GitHub resources from that admission survive.
+jit_write_active_admission_lease "$lease_a" mazaya-test owner/repo
+stale_unit="${GHRCTL_JIT_FAKE_UNITS_DIR}/ghrctl-jit-${lease_a:0:12}-999.service"
+: >"$stale_unit"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "missing worker journal with a surviving deterministic unit failed open"; fi
+rm -f "$stale_unit"
+stale_runtime="${JIT_DATA_DIR}/worker-runtime/${lease_a:0:12}-999"
+mkdir -p "$stale_runtime"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "missing worker journal with a surviving deterministic runtime failed open"; fi
+rmdir "$stale_runtime"
+JIT_TEST_CASE=stale-exact-label
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "surviving exact-label remote registration failed open"; fi
+JIT_TEST_CASE=valid
+jit_release_active_admission_lease "$lease_a"
+jit_assert_active_admission_available "$lease_b" || fail "reconciled stale admission remained blocked"
+JIT_ADMISSION_ID="$lease_saved_admission_id"
+rmdir "$(jit_worker_state_dir "$lease_a")"
 rm -f "$(jit_admission_file "$lease_a")" "$(jit_admission_file "$lease_b")"
 
 saved_admission_id="$JIT_ADMISSION_ID"
 JIT_ADMISSION_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+jq --arg id "$JIT_ADMISSION_ID" '.id=$id | .status="cleaned"' "$(jit_admission_file "$saved_admission_id")" | jit_atomic_write "$(jit_admission_file "$JIT_ADMISSION_ID")"
 mkdir -p "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
 worker_fault_points=(
   worker-after-boundary-mutation worker-after-group-mutation worker-after-user-mutation worker-after-subids-mutation
@@ -621,7 +747,7 @@ assert_eq "$(jq -r .status "$JIT_ADMISSION_FILE")" "completed"
 jq -e '.runtime_selection.helper and .runtime_selection.manifest and (.runtime_selection.helper_sha256|test("^[0-9a-f]{64}$")) and .runtime_selection.controller_revision and (.runtime_selection.controller_digest|test("^[0-9a-f]{64}$"))' "$JIT_ADMISSION_FILE" >/dev/null || fail "controller did not persist immutable runtime selection before spawning workers"
 first_runtime_helper="$(jq -r '.runtime_selection.helper' "$JIT_ADMISSION_FILE")"
 jq -s -e --arg helper "$first_runtime_helper" '[.[] | select(.sequence>=8) | .runtime_helper == $helper] | all' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json >/dev/null || fail "worker journal did not inherit the immutable runtime selection"
-jq -e '.runtime_selection.controller_manifest.files|length==6 and all(.[]; (.path|startswith("libexec/")) and (.sha256|test("^[0-9a-f]{64}$")))' "$JIT_ADMISSION_FILE" >/dev/null || fail "runtime provenance did not persist the deterministic libexec manifest"
+jq -e '.runtime_selection.controller_manifest.files|length==7 and all(.[]; (.path|startswith("libexec/")) and (.sha256|test("^[0-9a-f]{64}$")))' "$JIT_ADMISSION_FILE" >/dev/null || fail "runtime provenance did not persist the deterministic libexec manifest"
 provenance_root="$TMP/runtime-provenance"
 mkdir -p "$provenance_root/libexec"
 while IFS= read -r provenance_file; do cp "$ROOT/libexec/$provenance_file" "$provenance_root/libexec/$provenance_file"; done < <(jit_runtime_critical_libexec_files)

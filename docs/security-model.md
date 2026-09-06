@@ -32,7 +32,9 @@
 - verified disjoint real/subordinate ID pools against complete host maps;
 - private network, mount, temporary-file, shared-memory, and IPC namespaces per JIT worker;
 - pre-request JIT registration intent and exact-name/exact-label orphan reconciliation;
-- process-first quiescence and no-follow, regular-only, strictly bounded diagnostics;
+- systemd/cgroup-first quiescence, exact persisted process identities, and no traversal authority from stale/reused PIDs;
+- fail-closed worker-journal and stale-admission unit/runtime/exact-label reconciliation;
+- root-locked host/project diagnostic quotas, free-space floor, deterministic TTL/count pruning, and failure-evidence preference;
 - file- and parent-directory-fsynced critical JIT state replacement.
 
 ## Residual risks

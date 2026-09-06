@@ -45,7 +45,8 @@ Runners for the **same repository/trust boundary** may share that repository's r
 - Bounded one-job workers with verified disjoint identity pools and a fresh private network/mount/tmp/IPC, Linux user, home, runner copy, Rootless Docker daemon, and destructive trusted cleanup per job.
 - Complete fail-closed GitHub collection pagination and project-state-derived reusable-label rejection.
 - Write-ahead persistent-runner quarantine, resumable checkpoints, explicit recovery, and rollback that never silently restores broad-label access.
-- Durable JIT journals, pre-request registration intent, exact remote orphan reconciliation, and process-first bounded diagnostic retention.
+- Durable fail-closed JIT journals, stale-admission unit/runtime/exact-label reconciliation, and systemd/cgroup-first teardown with PID-reuse-safe recovery.
+- Root-locked bounded diagnostic retention with host/project quotas, a minimum-free-space guard, deterministic TTL/count pruning, and failure-evidence preference.
 
 ## Quick start
 

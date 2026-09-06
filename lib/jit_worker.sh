@@ -31,7 +31,7 @@ jit_runtime_controller_digest() {
 jit_runtime_critical_libexec_files() {
   # Keep this allow-list explicit so a newly added executable cannot silently
   # escape the controller provenance contract.
-  printf '%s\n' bounded_log.py collect_diagnostics.py durable_directory.py durable_replace.py jit-worker-sandbox.sh validate_id_map.py
+  printf '%s\n' bounded_log.py collect_diagnostics.py durable_directory.py durable_replace.py jit-worker-sandbox.sh prune_diagnostics.py validate_id_map.py
 }
 
 jit_runtime_controller_manifest_json() {
@@ -64,7 +64,8 @@ jit_runtime_controller_revision() {
 
 jit_worker_runtime_id() {
   local admission_id="$1" worker_id="$2"
-  printf '%s\0%s' "$admission_id" "$worker_id" | sha256sum | cut -c1-16
+  [[ "$admission_id" =~ ^[0-9a-f]{64}$ && "$worker_id" =~ ^worker-[0-9]{3,}$ ]] || return 1
+  printf '%s-%s' "${admission_id:0:12}" "${worker_id#worker-}"
 }
 
 jit_worker_runtime_dir() {
@@ -591,7 +592,7 @@ jit_write_worker_state() {
   durable_ensure_dir "$(dirname -- "$state_file")" 700
   if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]]; then
     boot_id="$(cat /proc/sys/kernel/random/boot_id)"
-    start_ticks="$(awk '{print $22}' "/proc/${pid}/stat")"
+    start_ticks="$(jit_process_start_ticks "$pid")"
   fi
   if [[ -r "$state_file" ]]; then
     jq --arg status "$status" --arg note "$note" --arg runner_id "$runner_id" --arg pid "$pid" --arg boot_id "$boot_id" --arg start_ticks "$start_ticks" --arg now "$(utc_now)" '
@@ -602,13 +603,13 @@ jit_write_worker_state() {
     ' "$state_file" | jit_atomic_write "$state_file"
   else
     jq -n --argjson schema_version "$JIT_SCHEMA_VERSION" --arg admission_id "$JIT_ADMISSION_ID" --arg worker_id "${state_file##*/}" --arg status "$status" --arg now "$(utc_now)" --arg note "$note" \
-      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,gid:null,group:null,root:null,home:null,runner_dir:null,runtime_dir:null,docker_socket:null,runtime_helper:null,runtime_manifest:null,runtime_helper_sha256:null,runtime_controller_revision:null,runtime_controller_digest:null,runtime_controller_manifest:null,runtime_controller_manifest_sha256:null,sandbox_unit:null,sandbox_network_unit:null,network_ready:null,subuid:null,subgid:null,id_pools:null,creation_stage:null,registration:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,worker_pid:null,worker_boot_id:null,worker_start_ticks:null,controller_process:null,controller_children:[],sandbox_main_pid:null,sandbox_slirp_pid:null,sandbox_boot_id:null,sandbox_slirp_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' \
+      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,gid:null,group:null,root:null,home:null,runner_dir:null,runtime_dir:null,docker_socket:null,runtime_helper:null,runtime_manifest:null,runtime_helper_sha256:null,runtime_controller_revision:null,runtime_controller_digest:null,runtime_controller_manifest:null,runtime_controller_manifest_sha256:null,sandbox_unit:null,sandbox_network_unit:null,network_ready:null,subuid:null,subgid:null,id_pools:null,creation_stage:null,registration:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,worker_pid:null,worker_boot_id:null,worker_start_ticks:null,controller_process:null,controller_children:[],sandbox_main_pid:null,sandbox_main_boot_id:null,sandbox_main_start_ticks:null,sandbox_slirp_pid:null,sandbox_slirp_boot_id:null,sandbox_slirp_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' \
       | jit_atomic_write "$state_file"
   fi
 }
 
 jit_execute_runner() {
-  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper main_pid=0 slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file
+  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper main_pid=0 main_ticks="" slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file
   jit_load_worker_identity "$state_file"
   user="$JIT_WORKER_USER"; group="$JIT_WORKER_GROUP"; worker_root="$JIT_WORKER_ROOT"; home="$JIT_WORKER_HOME"
   runner_dir="$JIT_WORKER_RUNNER_DIR"; runtime_dir="$JIT_WORKER_RUNTIME_DIR"; docker_socket="$JIT_WORKER_DOCKER_SOCKET"; unit="$JIT_WORKER_SANDBOX_UNIT"; network_unit="$JIT_WORKER_SANDBOX_NETWORK_UNIT"; network_ready="$JIT_WORKER_NETWORK_READY"
@@ -618,7 +619,7 @@ jit_execute_runner() {
     chmod 600 "$config_file"
     env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="$JIT_SYSTEM_PATH" XDG_RUNTIME_DIR="$(dirname "$docker_socket")" DOCKER_HOST="unix://${docker_socket}" \
       /bin/bash --noprofile --norc -c 'set -euo pipefail; IFS= read -r ACTIONS_RUNNER_INPUT_JITCONFIG; export ACTIONS_RUNNER_INPUT_JITCONFIG; exec "$1/run.sh"' jit-worker "$runner_dir" <"$config_file" &
-    runner_pid=$!; runner_boot="$(cat /proc/sys/kernel/random/boot_id)"; runner_ticks="$(awk '{print $22}' "/proc/${runner_pid}/stat")"
+    runner_pid=$!; runner_boot="$(cat /proc/sys/kernel/random/boot_id)"; runner_ticks="$(jit_process_start_ticks "$runner_pid")"
     jq --arg pid "$runner_pid" --arg boot "$runner_boot" --arg ticks "$runner_ticks" --arg now "$(utc_now)" '.controller_children=[{pid:($pid|tonumber),boot_id:$boot,start_ticks:($ticks|tonumber)}] | .updated_at=$now' "$state_file" | jit_atomic_write "$state_file"
     set +e; wait "$runner_pid"; exit_code=$?; set -e
     rm -f "$config_file"
@@ -636,8 +637,8 @@ jit_execute_runner() {
   runtime_helper="$JIT_ADMISSION_RUNTIME_HELPER"
   diagnostic_dir="${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/$(jq -r .worker_id "$state_file")"
   controller_log="${diagnostic_dir}/controller.log"
-  mkdir -p "$diagnostic_dir" "$(dirname "$network_ready")"
-  chmod 700 "${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}" "$diagnostic_dir"
+  jit_prepare_worker_diagnostic_destination "$state_file"
+  mkdir -p "$(dirname "$network_ready")"
   printf 'nameserver 10.0.2.3\n' >"${worker_root}/controller/resolv.conf"
   chown root:root "${worker_root}/controller/resolv.conf"; chmod 644 "${worker_root}/controller/resolv.conf"
   rm -f "$network_ready"
@@ -663,16 +664,24 @@ jit_execute_runner() {
     sleep 0.1
   done
   [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || { wait "$systemd_pid" || true; die "Private worker unit failed before publishing MainPID."; }
+  boot_id="$(cat /proc/sys/kernel/random/boot_id)"
+  main_ticks="$(jit_process_start_ticks "$main_pid" 2>/dev/null || true)"
+  [[ "$main_ticks" =~ ^[1-9][0-9]*$ ]] || { systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker MainPID identity could not be persisted."; }
+  jq --arg main_pid "$main_pid" --arg boot_id "$boot_id" --arg main_ticks "$main_ticks" --arg now "$(utc_now)" '
+    .sandbox_main_pid=($main_pid|tonumber) | .sandbox_main_boot_id=$boot_id | .sandbox_main_start_ticks=($main_ticks|tonumber) |
+    .creation_stage="sandbox-main-running" | .updated_at=$now
+  ' "$state_file" | jit_atomic_write "$state_file"
   nsenter --target "$main_pid" --net -- ip link set lo up
   systemd-run --quiet --collect --service-type=exec --unit "$network_unit" --property=KillMode=control-group \
     --property="StandardOutput=file:${network_ready}" slirp4netns --configure --mtu=65520 --disable-host-loopback --ready-fd 1 "$main_pid" tap0
   for attempt in $(seq 1 100); do [[ -s "$network_ready" ]] && break; systemctl is-active --quiet "$network_unit" || break; sleep 0.1; done
   [[ -s "$network_ready" ]] || { systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker network failed to initialize."; }
   chown root:"$group" "$network_ready"; chmod 640 "$network_ready"
-  slirp_pid="$(systemctl show --property=MainPID --value "$network_unit")"; boot_id="$(cat /proc/sys/kernel/random/boot_id)"
-  slirp_ticks="$(awk '{print $22}' "/proc/${slirp_pid}/stat")"
-  jq --arg main_pid "$main_pid" --arg slirp_pid "$slirp_pid" --arg slirp_ticks "$slirp_ticks" --arg boot_id "$boot_id" --arg now "$(utc_now)" '
-    .sandbox_main_pid=($main_pid|tonumber) | .sandbox_slirp_pid=($slirp_pid|tonumber) | .sandbox_slirp_start_ticks=($slirp_ticks|tonumber) | .sandbox_boot_id=$boot_id | .creation_stage="sandbox-running" | .updated_at=$now
+  slirp_pid="$(systemctl show --property=MainPID --value "$network_unit")"
+  slirp_ticks="$(jit_process_start_ticks "$slirp_pid" 2>/dev/null || true)"
+  [[ "$slirp_pid" =~ ^[1-9][0-9]*$ && "$slirp_ticks" =~ ^[1-9][0-9]*$ ]] || { systemctl stop "$network_unit" >/dev/null 2>&1 || true; systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker slirp identity could not be persisted."; }
+  jq --arg slirp_pid "$slirp_pid" --arg slirp_ticks "$slirp_ticks" --arg boot_id "$boot_id" --arg now "$(utc_now)" '
+    .sandbox_slirp_pid=($slirp_pid|tonumber) | .sandbox_slirp_boot_id=$boot_id | .sandbox_slirp_start_ticks=($slirp_ticks|tonumber) | .creation_stage="sandbox-running" | .updated_at=$now
   ' "$state_file" | jit_atomic_write "$state_file"
   jit_fault_inject worker-after-sandbox-start
   set +e
@@ -682,18 +691,103 @@ jit_execute_runner() {
   return "$exit_code"
 }
 
+jit_acquire_diagnostic_retention_lock() {
+  local output_var="$1" fd
+  durable_ensure_dir "$(dirname -- "$JIT_DIAGNOSTIC_RETENTION_LOCK_FILE")" 700
+  exec {fd}>>"$JIT_DIAGNOSTIC_RETENTION_LOCK_FILE"
+  chmod 600 "$JIT_DIAGNOSTIC_RETENTION_LOCK_FILE"
+  flock -x "$fd"
+  printf -v "$output_var" '%s' "$fd"
+}
+
+jit_release_diagnostic_retention_lock() {
+  local fd="$1"
+  [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+  flock -u "$fd"
+  eval "exec ${fd}>&-"
+}
+
+jit_prune_diagnostics_locked() {
+  local project="$1" reserve_bytes="$2" reserve_workers="$3"
+  python3 "${GHRCTL_ROOT}/libexec/prune_diagnostics.py" \
+    --root "$JIT_DIAGNOSTICS_DIR" --project "$project" \
+    --host-max-bytes "$JIT_DIAGNOSTIC_HOST_MAX_BYTES" --project-max-bytes "$JIT_DIAGNOSTIC_PROJECT_MAX_BYTES" \
+    --min-free-bytes "$JIT_DIAGNOSTIC_MIN_FREE_BYTES" --retention-seconds "$JIT_DIAGNOSTIC_RETENTION_SECONDS" \
+    --project-max-workers "$JIT_DIAGNOSTIC_PROJECT_MAX_WORKERS" \
+    --reserve-bytes "$reserve_bytes" --reserve-workers "$reserve_workers"
+}
+
+jit_write_diagnostic_retention_marker() {
+  local destination="$1" project="$2" admission_id="$3" worker_id="$4" status="$5" reserved_bytes="$6" marker created_epoch previous_status
+  marker="${destination}/.retention.json"
+  created_epoch="$(jq -r '.created_epoch // empty' "$marker" 2>/dev/null || true)"
+  previous_status="$(jq -r '.status // empty' "$marker" 2>/dev/null || true)"
+  [[ "$created_epoch" =~ ^[1-9][0-9]*$ ]] || created_epoch="$(date +%s)"
+  if [[ "$previous_status" =~ ^(cancelled|cleanup-pending|failed)$ && ! "$status" =~ ^(cancelled|cleanup-pending|failed)$ ]]; then
+    status="$previous_status"
+  fi
+  jq -n --argjson schema_version 1 --arg project "$project" --arg admission_id "$admission_id" --arg worker_id "$worker_id" \
+    --arg status "$status" --arg created_epoch "$created_epoch" --arg reserved_bytes "$reserved_bytes" --arg updated_at "$(utc_now)" \
+    '{schema_version:$schema_version,project:$project,admission_id:$admission_id,worker_id:$worker_id,status:$status,created_epoch:($created_epoch|tonumber),reserved_bytes:($reserved_bytes|tonumber),updated_at:$updated_at}' \
+    | jit_atomic_write "$marker"
+}
+
+jit_prepare_worker_diagnostic_destination() {
+  local state_file="$1" admission_id worker_id project destination reservation retention_lock_fd
+  admission_id="$(jq -r .admission_id "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"
+  project="$(jq -r .project "$(jit_admission_file "$admission_id")")"
+  [[ "$project" =~ ^[a-z0-9][a-z0-9-]*$ ]] || return 1
+  destination="${JIT_DIAGNOSTICS_DIR}/${admission_id}/${worker_id}"
+  reservation=$((JIT_DIAGNOSTIC_MAX_TOTAL_BYTES + JIT_DIAGNOSTIC_MAX_FILE_BYTES))
+  jit_acquire_diagnostic_retention_lock retention_lock_fd
+  if [[ -e "$destination" ]]; then
+    jq -e --arg project "$project" --arg admission_id "$admission_id" --arg worker_id "$worker_id" '
+      .schema_version==1 and .project==$project and .admission_id==$admission_id and .worker_id==$worker_id and
+      (.created_epoch|type=="number" and floor==. and .>=1) and (.reserved_bytes|type=="number" and floor==. and .>=0)
+    ' "${destination}/.retention.json" >/dev/null 2>&1 \
+      || { jit_release_diagnostic_retention_lock "$retention_lock_fd"; return 1; }
+  else
+    jit_prune_diagnostics_locked "$project" "$reservation" 1 \
+      || { jit_release_diagnostic_retention_lock "$retention_lock_fd"; return 1; }
+    durable_ensure_dir "${JIT_DIAGNOSTICS_DIR}/${admission_id}" 700
+    durable_ensure_dir "$destination" 700
+    jit_write_diagnostic_retention_marker "$destination" "$project" "$admission_id" "$worker_id" running "$reservation"
+  fi
+  jit_release_diagnostic_retention_lock "$retention_lock_fd"
+}
+
+jit_update_diagnostic_retention_status() {
+  local state_file="$1" admission_id worker_id project destination status retention_lock_fd
+  admission_id="$(jq -r .admission_id "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; status="$(jq -r .status "$state_file")"
+  destination="${JIT_DIAGNOSTICS_DIR}/${admission_id}/${worker_id}"
+  [[ -d "$destination" ]] || return 0
+  project="$(jq -r .project "$(jit_admission_file "$admission_id")")"
+  jit_acquire_diagnostic_retention_lock retention_lock_fd
+  jit_write_diagnostic_retention_marker "$destination" "$project" "$admission_id" "$worker_id" "$status" 0
+  jit_prune_diagnostics_locked "$project" 0 0 || { jit_release_diagnostic_retention_lock "$retention_lock_fd"; return 1; }
+  jit_release_diagnostic_retention_lock "$retention_lock_fd"
+}
+
 jit_capture_worker_diagnostics() {
-  local admission_id="$1" worker_id="$2" worker_root="$3" runner_dir="$4" destination_base destination source
+  local admission_id="$1" worker_id="$2" worker_root="$3" runner_dir="$4" state_file="$5" destination_base destination source status project retention_lock_fd
   destination_base="${JIT_DIAGNOSTICS_DIR}/${admission_id}/${worker_id}"; destination="${destination_base}/runner"
   [[ -n "$worker_root" && "$worker_root" != null && -n "$runner_dir" && "$runner_dir" != null ]] || return 0
   jit_assert_safe_worker_path "$worker_root"
   source="$runner_dir/_diag"
   [[ -e "$source" || -L "$source" ]] || return 0
-  [[ ! -e "$destination" ]] || return 0
-  mkdir -p "$destination_base"; chmod 700 "${JIT_DIAGNOSTICS_DIR}/${admission_id}" "$destination_base"
-  python3 "${GHRCTL_ROOT}/libexec/collect_diagnostics.py" \
-    --boundary "$worker_root" --source "$source" --destination "$destination" \
-    --max-files "$JIT_DIAGNOSTIC_MAX_FILES" --max-file-bytes "$JIT_DIAGNOSTIC_MAX_FILE_BYTES" --max-total-bytes "$JIT_DIAGNOSTIC_MAX_TOTAL_BYTES"
+  jit_prepare_worker_diagnostic_destination "$state_file" || return 1
+  project="$(jq -r .project "$(jit_admission_file "$admission_id")")"
+  jit_acquire_diagnostic_retention_lock retention_lock_fd
+  if [[ ! -e "$destination" ]]; then
+    python3 "${GHRCTL_ROOT}/libexec/collect_diagnostics.py" \
+      --boundary "$worker_root" --source "$source" --destination "$destination" \
+      --max-files "$JIT_DIAGNOSTIC_MAX_FILES" --max-file-bytes "$JIT_DIAGNOSTIC_MAX_FILE_BYTES" --max-total-bytes "$JIT_DIAGNOSTIC_MAX_TOTAL_BYTES" \
+      || { jit_release_diagnostic_retention_lock "$retention_lock_fd"; return 1; }
+  fi
+  status="$(jq -r '.status' "$state_file")"
+  jit_write_diagnostic_retention_marker "$destination_base" "$project" "$admission_id" "$worker_id" "$status" 0
+  jit_prune_diagnostics_locked "$project" 0 0 || { jit_release_diagnostic_retention_lock "$retention_lock_fd"; return 1; }
+  jit_release_diagnostic_retention_lock "$retention_lock_fd"
 }
 
 jit_runner_exists_remotely() {
@@ -780,11 +874,11 @@ jit_validate_worker_identity_state() {
 }
 
 jit_process_identity_active() {
-  local pid="$1" boot="$2" ticks="$3" current process_state
+  local pid="$1" boot="$2" ticks="$3" identity current process_state
   [[ "$pid" =~ ^[1-9][0-9]*$ && "$ticks" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" && "$boot" == "$(cat /proc/sys/kernel/random/boot_id)" ]] || return 1
-  process_state="$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || true)"
+  identity="$(jit_process_stat_identity "$pid" 2>/dev/null || true)"
+  IFS=$'\t' read -r process_state current <<<"$identity"
   [[ "$process_state" != Z ]] || return 1
-  current="$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true)"
   [[ "$current" == "$ticks" ]]
 }
 
@@ -800,7 +894,9 @@ jit_quiesce_worker() {
   local state_file="$1" user unit network_unit slirp_pid slirp_boot slirp_ticks attempt
   jit_test_backend_enabled && return 0
   user="$(jq -r '.user // empty' "$state_file")"; unit="$(jq -r '.sandbox_unit // empty' "$state_file")"; network_unit="$(jq -r '.sandbox_network_unit // empty' "$state_file")"
-  slirp_pid="$(jq -r '.sandbox_slirp_pid // 0' "$state_file")"; slirp_boot="$(jq -r '.sandbox_boot_id // empty' "$state_file")"; slirp_ticks="$(jq -r '.sandbox_slirp_start_ticks // 0' "$state_file")"
+  slirp_pid="$(jq -r '.sandbox_slirp_pid // 0' "$state_file")"; slirp_boot="$(jq -r '.sandbox_slirp_boot_id // .sandbox_boot_id // empty' "$state_file")"; slirp_ticks="$(jq -r '.sandbox_slirp_start_ticks // 0' "$state_file")"
+  # Deterministic transient units and their cgroups are the primary production
+  # teardown authority. Persisted PIDs are only independent recovery evidence.
   jit_stop_unit_and_verify "$unit" || return 1
   jit_stop_unit_and_verify "$network_unit" || return 1
   if jit_process_identity_active "$slirp_pid" "$slirp_boot" "$slirp_ticks"; then
@@ -890,9 +986,12 @@ jit_cleanup_worker_state() {
   fi
   current_pid="${BASHPID:-$$}"
   recorded_pid="$(jq -r '.worker_pid // .controller_pid // 0' "$state_file" 2>/dev/null || printf 0)"
-  # An external recovery caller must terminate the recorded worker tree even
-  # when the root already died; otherwise orphaned runner descendants can
-  # retain sockets, namespaces, or diagnostic files through identity teardown.
+  # Stop deterministic production cgroups before consulting any PID journal.
+  # The fake backend has no systemd authority and therefore relies on the exact
+  # persisted process identities below.
+  jit_quiesce_worker "$state_file" || cleanup_failed=1
+  # An external recovery caller may traverse descendants only while the exact
+  # persisted root identity is still current.
   if [[ "$recorded_pid" =~ ^[1-9][0-9]*$ && "$recorded_pid" != "$current_pid" ]]; then
     jit_terminate_worker_tree "$state_file" || cleanup_failed=1
   fi
@@ -900,15 +999,16 @@ jit_cleanup_worker_state() {
   group="$(jq -r '.group // empty' "$state_file")"; creation_stage="$(jq -r '.creation_stage // empty' "$state_file")"
   worker_root="$(jq -r '.root // empty' "$state_file")"; runner_dir="$(jq -r '.runner_dir // empty' "$state_file")"
   runner_id="$(jq -r '.runner_id // empty' "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; admission_id="$(jq -r .admission_id "$state_file")"
-  jit_quiesce_worker "$state_file" || cleanup_failed=1
-  (( cleanup_failed != 0 )) || jit_capture_worker_diagnostics "$admission_id" "$worker_id" "$worker_root" "$runner_dir" || cleanup_failed=1
+  (( cleanup_failed != 0 )) || jit_capture_worker_diagnostics "$admission_id" "$worker_id" "$worker_root" "$runner_dir" "$state_file" || cleanup_failed=1
   jit_destroy_worker_boundary "$user" "$uid" "$group" "$worker_root" "$creation_stage" "$state_file" || cleanup_failed=1
   jit_deregister_runner "$runner_id" || cleanup_failed=1
   jit_reconcile_registration "$state_file" cleanup || cleanup_failed=1
   if (( cleanup_failed == 0 )); then
     jit_write_worker_state "$state_file" cleaned
+    jit_update_diagnostic_retention_status "$state_file" || return 1
   else
     jit_write_worker_state "$state_file" cleanup-pending "Trusted cleanup or deregistration must be retried."
+    jit_update_diagnostic_retention_status "$state_file" || true
     return 1
   fi
 }
@@ -917,15 +1017,21 @@ jit_worker_exit_cleanup() {
   local state_file="$1" exit_code="$2"
   set +e
   if [[ -r "$state_file" ]]; then
+    if (( exit_code == 0 )); then
+      jit_write_worker_state "$state_file" finished "Runner listener exited successfully; collecting diagnostics before teardown."
+    else
+      jit_write_worker_state "$state_file" failed "Runner listener exited with status ${exit_code}; collecting failure diagnostics before teardown."
+    fi
     if jit_cleanup_worker_state "$state_file"; then
       if (( exit_code == 0 )); then
         jit_write_worker_state "$state_file" finished
       else
         jit_write_worker_state "$state_file" failed "Runner listener exited with status ${exit_code}; trusted cleanup completed."
       fi
-    else
-      jit_write_worker_state "$state_file" cleanup-pending "Runner listener exited with status ${exit_code}; trusted cleanup must be retried."
-    fi
+      else
+        jit_write_worker_state "$state_file" cleanup-pending "Runner listener exited with status ${exit_code}; trusted cleanup must be retried."
+      fi
+      jit_update_diagnostic_retention_status "$state_file" || true
   fi
   unset JIT_GENERATED_CONFIG JIT_API_TOKEN
 }
@@ -990,54 +1096,65 @@ jit_active_worker_count() {
 }
 
 jit_worker_pid_is_active() {
-  local state_file="$1" pid recorded_boot recorded_ticks current_ticks
+  local state_file="$1" pid recorded_boot recorded_ticks
   pid="$(jq -r '.worker_pid // .controller_pid // 0' "$state_file")"
   recorded_boot="$(jq -r '.worker_boot_id // .controller_boot_id // empty' "$state_file")"
   recorded_ticks="$(jq -r '.worker_start_ticks // .controller_start_ticks // 0' "$state_file")"
-  [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" && "$recorded_boot" == "$(cat /proc/sys/kernel/random/boot_id)" ]] || return 1
-  current_ticks="$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true)"
-  [[ "$recorded_ticks" == "$current_ticks" ]]
+  jit_process_identity_active "$pid" "$recorded_boot" "$recorded_ticks"
 }
 
 jit_collect_process_tree() {
-  local pid="$1" child
+  local pid="$1" expected_parent="${2:-}" snapshot state parent ticks child
   [[ "$pid" =~ ^[1-9][0-9]*$ && -d "/proc/$pid" ]] || return 0
-  printf '%s\n' "$pid"
+  snapshot="$(jit_process_stat_snapshot "$pid" 2>/dev/null || true)"
+  IFS=$'\t' read -r state parent ticks <<<"$snapshot"
+  [[ "$state" != Z && "$ticks" =~ ^[1-9][0-9]*$ && ( -z "$expected_parent" || "$parent" == "$expected_parent" ) ]] || return 0
+  printf '%s\t%s\n' "$pid" "$ticks"
   [[ -r "/proc/$pid/task/$pid/children" ]] || return 0
   while IFS= read -r child; do
     [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
-    jit_collect_process_tree "$child"
+    jit_collect_process_tree "$child" "$pid"
   done < <(tr ' ' '\n' <"/proc/$pid/task/$pid/children")
 }
 
 jit_terminate_worker_tree() {
-  local state_file="$1" root boot ticks pid attempt alive=0 extra_pid extra_boot extra_ticks
-  local -a tree=()
+  local state_file="$1" root boot ticks pid attempt alive=0 extra_pid extra_boot extra_ticks entry sampled_ticks
+  local -a tree=() sampled_tree=()
   declare -A tree_boot_ids=() tree_start_ticks=()
   root="$(jq -r '.controller_pid // .worker_pid // 0' "$state_file")"
   boot="$(jq -r '.controller_boot_id // .worker_boot_id // empty' "$state_file")"
   ticks="$(jq -r '.controller_start_ticks // .worker_start_ticks // 0' "$state_file")"
-  [[ "$root" =~ ^[1-9][0-9]*$ ]] || return 0
-  mapfile -t tree < <(jit_collect_process_tree "$root")
-  tree_boot_ids["$root"]="$boot"; tree_start_ticks["$root"]="$ticks"
-  for pid in "${tree[@]}"; do
-    [[ "$pid" == "$root" ]] && continue
-    [[ -r "/proc/$pid/stat" ]] || continue
-    tree_boot_ids["$pid"]="$(cat /proc/sys/kernel/random/boot_id)"
-    tree_start_ticks["$pid"]="$(awk '{print $22}' "/proc/$pid/stat")"
-  done
+  if jit_process_identity_active "$root" "$boot" "$ticks"; then
+    mapfile -t sampled_tree < <(jit_collect_process_tree "$root")
+    # A same-boot reuse between the first identity check and traversal discards
+    # the entire sampled tree; current /proc data must never revive stale kill
+    # authority.
+    if jit_process_identity_active "$root" "$boot" "$ticks"; then
+      for entry in "${sampled_tree[@]}"; do
+        IFS=$'\t' read -r pid sampled_ticks <<<"$entry"
+        [[ "$pid" =~ ^[1-9][0-9]*$ && "$sampled_ticks" =~ ^[1-9][0-9]*$ ]] || continue
+        tree+=("$pid")
+        tree_boot_ids["$pid"]="$boot"
+        tree_start_ticks["$pid"]="$sampled_ticks"
+      done
+    fi
+  fi
   while IFS=$'\t' read -r extra_pid extra_boot extra_ticks; do
     [[ "$extra_pid" =~ ^[1-9][0-9]*$ ]] || continue
     tree+=("$extra_pid")
     tree_boot_ids["$extra_pid"]="$extra_boot"
     tree_start_ticks["$extra_pid"]="$extra_ticks"
   done < <(jq -r '(.controller_children // [])[] | [(.pid|tostring),.boot_id,(.start_ticks|tostring)] | @tsv' "$state_file" 2>/dev/null || true)
-  for extra_pid in "$(jq -r '.sandbox_main_pid // 0' "$state_file" 2>/dev/null || printf 0)" "$(jq -r '.sandbox_slirp_pid // 0' "$state_file" 2>/dev/null || printf 0)"; do
-    [[ "$extra_pid" =~ ^[1-9][0-9]*$ ]] || continue
+  while IFS=$'\t' read -r extra_pid extra_boot extra_ticks; do
+    [[ "$extra_pid" =~ ^[1-9][0-9]*$ && "$extra_ticks" =~ ^[1-9][0-9]*$ && -n "$extra_boot" ]] || continue
     tree+=("$extra_pid")
-    tree_boot_ids["$extra_pid"]="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf '')"
-    tree_start_ticks["$extra_pid"]="$(awk '{print $22}' "/proc/$extra_pid/stat" 2>/dev/null || printf '')"
-  done
+    tree_boot_ids["$extra_pid"]="$extra_boot"
+    tree_start_ticks["$extra_pid"]="$extra_ticks"
+  done < <(jq -r '
+    [(.sandbox_main_pid // 0),(.sandbox_main_boot_id // .sandbox_boot_id // ""),(.sandbox_main_start_ticks // 0)],
+    [(.sandbox_slirp_pid // 0),(.sandbox_slirp_boot_id // .sandbox_boot_id // ""),(.sandbox_slirp_start_ticks // 0)] |
+    map(tostring) | @tsv
+  ' "$state_file" 2>/dev/null || true)
   ((${#tree[@]} > 0)) || return 0
   # Terminate children first so an abrupt worker exit cannot orphan a process
   # that still owns a socket, namespace, or host-mutation resource.
@@ -1068,7 +1185,7 @@ jit_terminate_worker_tree() {
 jit_record_controller_pid() {
   local state_file="$1" pid="$2" boot_id start_ticks
   [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
-  boot_id="$(cat /proc/sys/kernel/random/boot_id)"; start_ticks="$(awk '{print $22}' "/proc/${pid}/stat")"
+  boot_id="$(cat /proc/sys/kernel/random/boot_id)"; start_ticks="$(jit_process_start_ticks "$pid")"
   jq --arg pid "$pid" --arg boot_id "$boot_id" --arg start_ticks "$start_ticks" --arg now "$(utc_now)" '
     .controller_pid=($pid|tonumber) | .controller_boot_id=$boot_id | .controller_start_ticks=($start_ticks|tonumber) |
     .worker_pid=($pid|tonumber) | .worker_boot_id=$boot_id | .worker_start_ticks=($start_ticks|tonumber) | .controller_process="jit_worker_process" | .updated_at=$now
@@ -1112,19 +1229,15 @@ jit_spawn_worker() {
 }
 
 jit_cleanup_admission_workers() {
-  local state_dir file pid status user failures=0
+  local state_dir file pid status failures=0
   state_dir="$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
   [[ -d "$state_dir" ]] || return 0
   shopt -s nullglob
   for file in "$state_dir"/*.json; do
     pid="$(jq -r '.controller_pid // 0' "$file")"; status="$(jq -r .status "$file")"
     if [[ "$status" =~ ^(allocated|creating|boundary-ready|registration-requested|registered|running|cleanup-pending)$ ]]; then
+      jit_quiesce_worker "$file" || failures=$((failures + 1))
       jit_terminate_worker_tree "$file" || failures=$((failures + 1))
-      user="$(jq -r '.user // empty' "$file")"
-      if ! jit_test_backend_enabled && [[ -n "$user" ]] && id "$user" >/dev/null 2>&1; then
-        pkill -TERM -u "$user" >/dev/null 2>&1 || true
-      fi
-      jit_worker_pid_is_active "$file" && kill -KILL "$pid" 2>/dev/null || true
     fi
   done
   for file in "$state_dir"/*.json; do
