@@ -87,23 +87,28 @@ jit_assert_unix_socket_path() {
 }
 
 jit_assert_safe_worker_runtime_path() {
-  local path="$1" canonical expected_prefix runtime_id
+  local path="$1" admission_id="${2:-}" worker_id="${3:-}" canonical expected_prefix runtime_id expected_runtime_id
   [[ "$path" == /* && "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
   canonical="$(readlink -m -- "$path")" || return 1
   [[ "$canonical" == "$path" && "$path" != /home && "$path" != /home/* && "$path" != /root && "$path" != /root/* ]] || return 1
+  runtime_id="${path##*/}"
   if jit_test_backend_enabled; then
     expected_prefix="$(readlink -m -- "$JIT_DATA_DIR/worker-runtime")/"
     [[ "$path" == "$expected_prefix"* && "$path" != "$expected_prefix" ]] || return 1
   else
     expected_prefix="$(readlink -m -- "$JIT_WORKER_RUNTIME_ROOT")/"
-    runtime_id="${path##*/}"
-    [[ "$path" == "$expected_prefix"* && "$runtime_id" =~ ^[0-9a-f]{16}$ ]] || return 1
+    [[ "$path" == "$expected_prefix"* && "$runtime_id" =~ ^[0-9a-f]{12}-[0-9]{3,}$ ]] || return 1
+  fi
+  if [[ -n "$admission_id" || -n "$worker_id" ]]; then
+    [[ -n "$admission_id" && -n "$worker_id" ]] || return 1
+    expected_runtime_id="$(jit_worker_runtime_id "$admission_id" "$worker_id")" || return 1
+    [[ "$runtime_id" == "$expected_runtime_id" ]] || return 1
   fi
 }
 
 jit_validate_worker_runtime_socket() {
-  local runtime_dir="$1" socket="$2"
-  jit_assert_safe_worker_runtime_path "$runtime_dir" || return 1
+  local runtime_dir="$1" socket="$2" admission_id="${3:-}" worker_id="${4:-}"
+  jit_assert_safe_worker_runtime_path "$runtime_dir" "$admission_id" "$worker_id" || return 1
   [[ "$socket" == "$runtime_dir/docker.sock" ]] || return 1
   jit_assert_unix_socket_path "$socket"
 }
@@ -275,6 +280,7 @@ jit_verify_system_path() {
 }
 
 jit_require_clean_host_runtime() {
+  local slirp_help slirp_version
   if jit_test_backend_enabled; then
     [[ "$JIT_SYSTEM_PATH" == "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ]] || die "JIT PATH must be the fixed system-only path."
     return 0
@@ -288,6 +294,12 @@ jit_require_clean_host_runtime() {
   have python3 || die "Python 3 is required for durable state and bounded diagnostics."
   have systemd-run || die "systemd-run is required for per-worker sandboxing."
   have slirp4netns || die "slirp4netns is required for a private worker network."
+  slirp_help="$(LC_ALL=C slirp4netns --help 2>&1)" || die "slirp4netns help detection failed."
+  [[ "$slirp_help" == *"--enable-sandbox"* && "$slirp_help" == *"--enable-seccomp"* ]] \
+    || die "slirp4netns must support sandbox and seccomp protections."
+  slirp_version="$(LC_ALL=C slirp4netns --version 2>&1)" || die "slirp4netns version detection failed."
+  grep -Eq '^libseccomp:[[:space:]]+[0-9]' <<<"$slirp_version" \
+    || die "slirp4netns must be built with libseccomp support."
   have nsenter || die "nsenter is required to verify per-worker namespaces."
   have ip || die "iproute2 is required to initialize private loopback."
   have dockerd-rootless.sh || die "Rootless Docker daemon tooling is required before JIT launch."
@@ -395,13 +407,36 @@ jit_checkpoint_worker_creation() {
   jq --arg stage "$stage" --arg status "$status" --arg now "$(utc_now)" '.creation_stage=$stage | .status=$status | .updated_at=$now' "$state_file" | jit_atomic_write "$state_file"
 }
 
+jit_checkpoint_worker_resource() {
+  local state_file="$1" resource="$2" checkpoint="$3" stage="${4:-}"
+  case "${resource}:${checkpoint}" in
+    boundary:mutation_started|boundary:created|group:mutation_started|group:created|user:mutation_started|user:created|\
+    subids:mutation_started|subids:created|runner_seed:mutation_started|runner_seed:created|runtime:mutation_started|runtime:created|\
+    sandbox_unit:mutation_started|sandbox_unit:created|sandbox_unit:identity_persisted|\
+    network_unit:mutation_started|network_unit:created|network_unit:identity_persisted) ;;
+    *) die "Invalid JIT worker resource checkpoint: ${resource}:${checkpoint}" ;;
+  esac
+  jq --arg resource "$resource" --arg checkpoint "$checkpoint" --arg stage "$stage" --arg now "$(utc_now)" '
+    .resources[$resource][$checkpoint]=true |
+    (if $stage=="" then . else .creation_stage=$stage end) |
+    .updated_at=$now
+  ' "$state_file" | jit_atomic_write "$state_file"
+}
+
+jit_worker_resource_may_exist() {
+  local state_file="$1" resource="$2"
+  jq -e --arg resource "$resource" '
+    .resources[$resource].mutation_started==true or .resources[$resource].created==true
+  ' "$state_file" >/dev/null 2>&1
+}
+
 jit_plan_worker_identity() {
   local state_file="$1" sequence="$2" admission_id worker_id user uid subid_start worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready runtime_helper runtime_manifest runtime_helper_sha256 runtime_controller_revision runtime_controller_digest runtime_controller_manifest runtime_controller_manifest_sha256
   admission_id="$JIT_ADMISSION_ID"; worker_id="${state_file##*/}"; worker_id="${worker_id%.json}"
   user="$(jit_worker_identity "$admission_id" "$sequence")"; uid="$(jit_worker_uid "$admission_id" "$sequence")"; subid_start="$(jit_worker_subid_start "$admission_id" "$sequence")"
   worker_root="${JIT_BOUNDARY_ROOT}/${admission_id}/${worker_id}.boundary"; home="${worker_root}/home"; runner_dir="${home}/actions-runner"
   runtime_dir="$(jit_worker_runtime_dir "$admission_id" "$worker_id" "$worker_root")"; docker_socket="${runtime_dir}/docker.sock"; unit="$(jit_worker_unit "$admission_id" "$sequence")"; network_unit="$(jit_worker_network_unit "$admission_id" "$sequence")"; network_ready="${worker_root}/controller/network.ready"
-  jit_validate_worker_runtime_socket "$runtime_dir" "$docker_socket" || die "Persisted JIT worker runtime/socket layout is unsafe."
+  jit_validate_worker_runtime_socket "$runtime_dir" "$docker_socket" "$admission_id" "$worker_id" || die "Persisted JIT worker runtime/socket layout is unsafe."
   runtime_helper="${JIT_ADMISSION_RUNTIME_HELPER:-}"
   runtime_manifest="${JIT_ADMISSION_RUNTIME_MANIFEST:-}"
   runtime_helper_sha256="${JIT_ADMISSION_RUNTIME_HELPER_SHA256:-}"
@@ -461,7 +496,7 @@ jit_create_worker_boundary_locked() {
   home="$JIT_WORKER_HOME"; runner_dir="$JIT_WORKER_RUNNER_DIR"; runtime_dir="$JIT_WORKER_RUNTIME_DIR"; docker_socket="$JIT_WORKER_DOCKER_SOCKET"
   subuid_start="$(jq -r .subuid.start "$state_file")"; subgid_start="$(jq -r .subgid.start "$state_file")"; subid_count="$(jq -r .subuid.count "$state_file")"
   subuid_end=$((subuid_start + subid_count - 1)); subgid_end=$((subgid_start + subid_count - 1))
-  jit_validate_worker_runtime_socket "$runtime_dir" "$docker_socket"
+  jit_validate_worker_runtime_socket "$runtime_dir" "$docker_socket" "$(jq -r .admission_id "$state_file")" "$(jq -r .worker_id "$state_file")"
   jit_validate_host_id_maps "$state_file"
   id "$user" >/dev/null 2>&1 && die "JIT worker user already exists: $user"
   getent group "$group" >/dev/null 2>&1 && die "JIT worker group already exists: $group"
@@ -469,29 +504,32 @@ jit_create_worker_boundary_locked() {
   getent group "$uid" >/dev/null 2>&1 && die "Deterministic JIT worker GID is already allocated: $uid"
   [[ ! -e "$worker_root" ]] || die "JIT worker boundary already exists: $worker_root"
   [[ ! -e "$runtime_dir" ]] || die "JIT worker runtime directory already exists: $runtime_dir"
+  jit_checkpoint_worker_resource "$state_file" boundary mutation_started boundary-create-started
   mkdir -p "$(dirname "$worker_root")" "$worker_root"
   chmod 711 "$(dirname "$worker_root")"
   chmod 755 "$worker_root"
   jit_fault_inject worker-after-boundary-mutation
-  jit_checkpoint_worker_creation "$state_file" boundary-created
-  jit_checkpoint_worker_creation "$state_file" group-create-started
+  jit_checkpoint_worker_resource "$state_file" boundary created boundary-created
+  jit_checkpoint_worker_resource "$state_file" group mutation_started group-create-started
   groupadd --gid "$uid" "$group"
   jit_fault_inject worker-after-group-mutation
-  jit_checkpoint_worker_creation "$state_file" group-created
-  jit_checkpoint_worker_creation "$state_file" user-create-started
+  jit_checkpoint_worker_resource "$state_file" group created group-created
+  jit_checkpoint_worker_resource "$state_file" user mutation_started user-create-started
   useradd --no-log-init --no-user-group --create-home --home-dir "$home" --shell /bin/bash --uid "$uid" --gid "$group" \
     -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 "$user"
   jit_fault_inject worker-after-user-mutation
-  jit_checkpoint_worker_creation "$state_file" user-created
+  jit_checkpoint_worker_resource "$state_file" user created user-created
   passwd -l "$user" >/dev/null 2>&1 || true
   [[ "$(id -u "$user")" == "$uid" && "$(id -g "$user")" == "$uid" ]] || die "Created JIT worker identity does not match the journal."
   if id -nG "$user" | tr ' ' '\n' | grep -Eq '^(sudo|wheel|docker)$'; then
     die "JIT worker user belongs to a privileged group: $user"
   fi
+  jit_checkpoint_worker_resource "$state_file" subids mutation_started subids-create-started
   usermod --add-subuids "${subuid_start}-${subuid_end}" --add-subgids "${subgid_start}-${subgid_end}" "$user"
   jit_validate_host_id_maps "$state_file"
   jit_fault_inject worker-after-subids-mutation
-  jit_checkpoint_worker_creation "$state_file" subids-allocated
+  jit_checkpoint_worker_resource "$state_file" subids created subids-allocated
+  jit_checkpoint_worker_resource "$state_file" runner_seed mutation_started runner-seed-create-started
   chown root:"$user" "$worker_root"; chmod 710 "$worker_root"
   chmod 700 "$home"
   mkdir -p "$runner_dir" "${worker_root}/controller"
@@ -500,7 +538,8 @@ jit_create_worker_boundary_locked() {
   chown -R "$user:$user" "$home"
   find "$runner_dir" -type d -exec chmod u+rwx {} +
   jit_fault_inject worker-after-runner-seed-mutation
-  jit_checkpoint_worker_creation "$state_file" runner-seed-copied
+  jit_checkpoint_worker_resource "$state_file" runner_seed created runner-seed-copied
+  jit_checkpoint_worker_resource "$state_file" runtime mutation_started runtime-create-started
   if jit_test_backend_enabled; then
     mkdir -p "$runtime_dir"
     chmod 700 "$home" "$runtime_dir"
@@ -511,7 +550,7 @@ jit_create_worker_boundary_locked() {
     chown "$user:$group" "$runtime_dir"; chmod 700 "$runtime_dir"
   fi
   jit_fault_inject worker-after-sandbox-mutation
-  jit_checkpoint_worker_creation "$state_file" sandbox-prepared
+  jit_checkpoint_worker_resource "$state_file" runtime created sandbox-prepared
   jit_checkpoint_worker_creation "$state_file" ready boundary-ready
   jit_release_host_mutation_lock "$host_lock_fd"
   JIT_WORKER_HOST_MUTATION_LOCK_FD=""
@@ -526,27 +565,31 @@ jit_create_worker_boundary() {
   jit_assert_safe_worker_path "$JIT_WORKER_ROOT"
   [[ ! -e "$JIT_WORKER_ROOT" ]] || die "JIT worker boundary already exists: $JIT_WORKER_ROOT"
   if jit_test_backend_enabled; then
+    jit_checkpoint_worker_resource "$state_file" boundary mutation_started boundary-create-started
     mkdir -p "$JIT_WORKER_RUNNER_DIR" "${JIT_WORKER_HOME}/.local/share/docker" "$JIT_WORKER_RUNTIME_DIR" "${JIT_WORKER_ROOT}/controller"
     jit_fault_inject worker-after-boundary-mutation
-    jit_checkpoint_worker_creation "$state_file" boundary-created
-    jit_checkpoint_worker_creation "$state_file" group-create-started
+    jit_checkpoint_worker_resource "$state_file" boundary created boundary-created
+    jit_checkpoint_worker_resource "$state_file" group mutation_started group-create-started
     : >"${JIT_WORKER_ROOT}/.fake-group"
     jit_fault_inject worker-after-group-mutation
-    jit_checkpoint_worker_creation "$state_file" group-created
-    jit_checkpoint_worker_creation "$state_file" user-create-started
+    jit_checkpoint_worker_resource "$state_file" group created group-created
+    jit_checkpoint_worker_resource "$state_file" user mutation_started user-create-started
     : >"${JIT_WORKER_ROOT}/.fake-user"
     jit_fault_inject worker-after-user-mutation
-    jit_checkpoint_worker_creation "$state_file" user-created
+    jit_checkpoint_worker_resource "$state_file" user created user-created
+    jit_checkpoint_worker_resource "$state_file" subids mutation_started subids-create-started
     : >"${JIT_WORKER_ROOT}/.fake-subids"
     jit_fault_inject worker-after-subids-mutation
-    jit_checkpoint_worker_creation "$state_file" subids-allocated
+    jit_checkpoint_worker_resource "$state_file" subids created subids-allocated
+    jit_checkpoint_worker_resource "$state_file" runner_seed mutation_started runner-seed-create-started
     cp -a "$JIT_RUNNER_SEED/." "$JIT_WORKER_RUNNER_DIR/"
     jit_fault_inject worker-after-runner-seed-mutation
-    jit_checkpoint_worker_creation "$state_file" runner-seed-copied
+    jit_checkpoint_worker_resource "$state_file" runner_seed created runner-seed-copied
+    jit_checkpoint_worker_resource "$state_file" runtime mutation_started runtime-create-started
     chmod 700 "$JIT_WORKER_HOME" "$JIT_WORKER_RUNTIME_DIR"
     : >"${JIT_WORKER_ROOT}/.fake-sandbox"
     jit_fault_inject worker-after-sandbox-mutation
-    jit_checkpoint_worker_creation "$state_file" sandbox-prepared
+    jit_checkpoint_worker_resource "$state_file" runtime created sandbox-prepared
     : >"$JIT_WORKER_DOCKER_SOCKET"
     jit_fault_inject worker-after-docker-mutation
     jit_checkpoint_worker_creation "$state_file" docker-started
@@ -602,14 +645,15 @@ jit_write_worker_state() {
       (if $pid=="" or $start_ticks=="" then . else .controller_pid=($pid|tonumber) | .controller_boot_id=$boot_id | .controller_start_ticks=($start_ticks|tonumber) | .worker_pid=($pid|tonumber) | .worker_boot_id=$boot_id | .worker_start_ticks=($start_ticks|tonumber) | .controller_process="jit_worker_process" end)
     ' "$state_file" | jit_atomic_write "$state_file"
   else
-    jq -n --argjson schema_version "$JIT_SCHEMA_VERSION" --arg admission_id "$JIT_ADMISSION_ID" --arg worker_id "${state_file##*/}" --arg status "$status" --arg now "$(utc_now)" --arg note "$note" \
-      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,gid:null,group:null,root:null,home:null,runner_dir:null,runtime_dir:null,docker_socket:null,runtime_helper:null,runtime_manifest:null,runtime_helper_sha256:null,runtime_controller_revision:null,runtime_controller_digest:null,runtime_controller_manifest:null,runtime_controller_manifest_sha256:null,sandbox_unit:null,sandbox_network_unit:null,network_ready:null,subuid:null,subgid:null,id_pools:null,creation_stage:null,registration:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,worker_pid:null,worker_boot_id:null,worker_start_ticks:null,controller_process:null,controller_children:[],sandbox_main_pid:null,sandbox_main_boot_id:null,sandbox_main_start_ticks:null,sandbox_slirp_pid:null,sandbox_slirp_boot_id:null,sandbox_slirp_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' \
+    jq -n --argjson schema_version "$JIT_WORKER_SCHEMA_VERSION" --arg admission_id "$JIT_ADMISSION_ID" --arg worker_id "${state_file##*/}" --arg status "$status" --arg now "$(utc_now)" --arg note "$note" \
+      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,gid:null,group:null,root:null,home:null,runner_dir:null,runtime_dir:null,docker_socket:null,runtime_helper:null,runtime_manifest:null,runtime_helper_sha256:null,runtime_controller_revision:null,runtime_controller_digest:null,runtime_controller_manifest:null,runtime_controller_manifest_sha256:null,sandbox_unit:null,sandbox_network_unit:null,network_ready:null,subuid:null,subgid:null,id_pools:null,creation_stage:null,resources:{boundary:{mutation_started:false,created:false},group:{mutation_started:false,created:false},user:{mutation_started:false,created:false},subids:{mutation_started:false,created:false},runner_seed:{mutation_started:false,created:false},runtime:{mutation_started:false,created:false},sandbox_unit:{mutation_started:false,created:false,identity_persisted:false},network_unit:{mutation_started:false,created:false,identity_persisted:false}},registration:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,worker_pid:null,worker_boot_id:null,worker_start_ticks:null,controller_process:null,controller_children:[],sandbox_main_pid:null,sandbox_main_boot_id:null,sandbox_main_start_ticks:null,sandbox_slirp_pid:null,sandbox_slirp_boot_id:null,sandbox_slirp_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' \
       | jit_atomic_write "$state_file"
   fi
 }
 
 jit_execute_runner() {
-  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper main_pid=0 main_ticks="" slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file
+  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper main_pid=0 main_ticks="" slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file protected_path network_inaccessible_paths=""
+  local -a network_systemd_args network_protected_paths
   jit_load_worker_identity "$state_file"
   user="$JIT_WORKER_USER"; group="$JIT_WORKER_GROUP"; worker_root="$JIT_WORKER_ROOT"; home="$JIT_WORKER_HOME"
   runner_dir="$JIT_WORKER_RUNNER_DIR"; runtime_dir="$JIT_WORKER_RUNTIME_DIR"; docker_socket="$JIT_WORKER_DOCKER_SOCKET"; unit="$JIT_WORKER_SANDBOX_UNIT"; network_unit="$JIT_WORKER_SANDBOX_NETWORK_UNIT"; network_ready="$JIT_WORKER_NETWORK_READY"
@@ -643,6 +687,7 @@ jit_execute_runner() {
   chown root:root "${worker_root}/controller/resolv.conf"; chmod 644 "${worker_root}/controller/resolv.conf"
   rm -f "$network_ready"
 
+  jit_checkpoint_worker_resource "$state_file" sandbox_unit mutation_started sandbox-unit-start-requested
   set +e
   printf '%s\n' "$config" | systemd-run --quiet --collect --wait --pipe --service-type=exec --unit "$unit" \
     --uid "$user" --gid "$group" \
@@ -669,19 +714,56 @@ jit_execute_runner() {
   [[ "$main_ticks" =~ ^[1-9][0-9]*$ ]] || { systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker MainPID identity could not be persisted."; }
   jq --arg main_pid "$main_pid" --arg boot_id "$boot_id" --arg main_ticks "$main_ticks" --arg now "$(utc_now)" '
     .sandbox_main_pid=($main_pid|tonumber) | .sandbox_main_boot_id=$boot_id | .sandbox_main_start_ticks=($main_ticks|tonumber) |
+    .resources.sandbox_unit.created=true | .resources.sandbox_unit.identity_persisted=true |
     .creation_stage="sandbox-main-running" | .updated_at=$now
   ' "$state_file" | jit_atomic_write "$state_file"
+  jit_fault_inject worker-after-main-pid-persisted
+  jit_fault_inject worker-before-nsenter
   nsenter --target "$main_pid" --net -- ip link set lo up
-  systemd-run --quiet --collect --service-type=exec --unit "$network_unit" --property=KillMode=control-group \
-    --property="StandardOutput=file:${network_ready}" slirp4netns --configure --mtu=65520 --disable-host-loopback --ready-fd 1 "$main_pid" tap0
+  jit_fault_inject worker-after-nsenter
+  network_protected_paths=(/root "$STATE_DIR" "$DATA_DIR" "$LOG_DIR" "/proc/${BASHPID:-$$}" "/proc/${PPID}" /run/docker.sock /var/run/docker.sock)
+  if [[ -n "${GHRCTL_JIT_APP_PRIVATE_KEY_FILE:-}" ]]; then
+    network_protected_paths+=("$GHRCTL_JIT_APP_PRIVATE_KEY_FILE")
+  fi
+  network_systemd_args=(
+    --quiet --collect --service-type=exec --unit "$network_unit" --uid root --gid root
+    --property=KillMode=control-group --property=UMask=0077
+    --property=NoNewPrivileges=yes --property=PrivateTmp=yes --property=PrivateMounts=yes
+    --property=ProtectHome=yes --property=ProtectSystem=strict --property=ProtectControlGroups=yes
+    --property=ProtectKernelTunables=yes --property=ProtectKernelModules=yes --property=ProtectKernelLogs=yes --property=ProtectClock=yes
+    --property=LockPersonality=yes --property=RestrictSUIDSGID=yes
+    --property="CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN"
+    --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+    --property="StandardOutput=file:${network_ready}"
+  )
+  for protected_path in "${network_protected_paths[@]}"; do
+    [[ "$protected_path" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "Network-helper protected path is unsafe: $protected_path"
+    network_inaccessible_paths+=" -${protected_path}"
+  done
+  network_systemd_args+=(--property="InaccessiblePaths=${network_inaccessible_paths# }")
+  jit_checkpoint_worker_resource "$state_file" network_unit mutation_started network-unit-start-requested
+  systemd-run "${network_systemd_args[@]}" /bin/bash --noprofile --norc -c '
+    set -Eeuo pipefail
+    target_pid="$1"; shift
+    for protected_path in "$@"; do
+      [[ ! -r "$protected_path" ]] || { printf "Network helper can read protected host path: %s\n" "$protected_path" >&2; exit 77; }
+    done
+    exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      slirp4netns --enable-sandbox --enable-seccomp --configure --mtu=65520 --disable-host-loopback --ready-fd 1 "$target_pid" tap0
+  ' jit-slirp "$main_pid" "${network_protected_paths[@]}"
+  jit_checkpoint_worker_resource "$state_file" network_unit created network-unit-created
+  jit_fault_inject worker-after-network-unit-created
+  jit_fault_inject worker-before-network-readiness
   for attempt in $(seq 1 100); do [[ -s "$network_ready" ]] && break; systemctl is-active --quiet "$network_unit" || break; sleep 0.1; done
   [[ -s "$network_ready" ]] || { systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker network failed to initialize."; }
   chown root:"$group" "$network_ready"; chmod 640 "$network_ready"
   slirp_pid="$(systemctl show --property=MainPID --value "$network_unit")"
   slirp_ticks="$(jit_process_start_ticks "$slirp_pid" 2>/dev/null || true)"
   [[ "$slirp_pid" =~ ^[1-9][0-9]*$ && "$slirp_ticks" =~ ^[1-9][0-9]*$ ]] || { systemctl stop "$network_unit" >/dev/null 2>&1 || true; systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker slirp identity could not be persisted."; }
+  jit_fault_inject worker-before-slirp-identity-persisted
   jq --arg slirp_pid "$slirp_pid" --arg slirp_ticks "$slirp_ticks" --arg boot_id "$boot_id" --arg now "$(utc_now)" '
-    .sandbox_slirp_pid=($slirp_pid|tonumber) | .sandbox_slirp_boot_id=$boot_id | .sandbox_slirp_start_ticks=($slirp_ticks|tonumber) | .creation_stage="sandbox-running" | .updated_at=$now
+    .sandbox_slirp_pid=($slirp_pid|tonumber) | .sandbox_slirp_boot_id=$boot_id | .sandbox_slirp_start_ticks=($slirp_ticks|tonumber) |
+    .resources.network_unit.identity_persisted=true | .creation_stage="sandbox-running" | .updated_at=$now
   ' "$state_file" | jit_atomic_write "$state_file"
   jit_fault_inject worker-after-sandbox-start
   set +e
@@ -836,20 +918,6 @@ jit_reconcile_registration() {
   ' "$state_file" | jit_atomic_write "$state_file"
 }
 
-jit_stage_may_own_group() {
-  case "$1" in
-    group-create-started|group-created|user-create-started|user-created|subids-allocated|runner-seed-copied|sandbox-prepared|sandbox-running|ready) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-jit_stage_may_own_user() {
-  case "$1" in
-    user-create-started|user-created|subids-allocated|runner-seed-copied|sandbox-prepared|sandbox-running|ready) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 jit_validate_worker_identity_state() {
   local state_file="$1" admission_id worker_id sequence expected_user expected_uid expected_subid expected_root expected_home expected_runner expected_runtime expected_socket expected_unit expected_network_unit real_start real_end sub_start sub_end sub_count seed slots
   admission_id="$(jq -r .admission_id "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; sequence="$(jq -r '.sequence // empty' "$state_file")"
@@ -870,7 +938,7 @@ jit_validate_worker_identity_state() {
      "$(jq -r .subgid.start "$state_file")" == "$expected_subid" && "$(jq -r .subuid.count "$state_file")" == "$sub_count" &&
      "$(jq -r .subgid.count "$state_file")" == "$sub_count" ]] || return 1
   jit_assert_safe_worker_path "$expected_root"
-  jit_validate_worker_runtime_socket "$expected_runtime" "$expected_socket"
+  jit_validate_worker_runtime_socket "$expected_runtime" "$expected_socket" "$admission_id" "$worker_id"
 }
 
 jit_process_identity_active() {
@@ -914,7 +982,7 @@ jit_quiesce_worker() {
 }
 
 jit_destroy_worker_boundary() {
-  local user="$1" uid="$2" group="$3" worker_root="$4" creation_stage="$5" state_file="${6:-}" host_lock_fd runtime_dir subuid_start subgid_start subid_count subuid_end subgid_end cleanup_status=0
+  local user="$1" uid="$2" group="$3" worker_root="$4" state_file="${5:-}" host_lock_fd runtime_dir subuid_start subgid_start subid_count subuid_end subgid_end cleanup_status=0
   [[ -n "$worker_root" && "$worker_root" != null ]] || return 0
   jit_assert_safe_worker_path "$worker_root"
   [[ "$uid" =~ ^[1-9][0-9]*$ && "$user" =~ ^ghajit-[a-f0-9]{12}-[0-9]{3,}$ && "$group" == "$user" ]] || return 1
@@ -925,7 +993,7 @@ jit_destroy_worker_boundary() {
   if [[ -z "$runtime_dir" ]]; then
     runtime_dir="${worker_root}/runtime"
   fi
-  jit_validate_worker_runtime_socket "$runtime_dir" "${runtime_dir}/docker.sock" || return 1
+  jit_validate_worker_runtime_socket "$runtime_dir" "${runtime_dir}/docker.sock" "$(jq -r .admission_id "$state_file")" "$(jq -r .worker_id "$state_file")" || return 1
   jit_acquire_host_mutation_lock host_lock_fd || return 1
   if [[ "${GHRCTL_DESTRUCTIVE_TEST:-0}" == 1 && "${GHRCTL_JIT_TEST_LOCK_HOLD_SECONDS:-}" =~ ^[1-9][0-9]*$ ]]; then
     sleep "$GHRCTL_JIT_TEST_LOCK_HOLD_SECONDS"
@@ -946,16 +1014,18 @@ jit_destroy_worker_boundary() {
   else
     cleanup_status=1
   fi
-  if jit_stage_may_own_user "$creation_stage" && id "$user" >/dev/null 2>&1; then
+  if jit_worker_resource_may_exist "$state_file" user && id "$user" >/dev/null 2>&1; then
     if pgrep -u "$user" >/dev/null 2>&1; then
       cleanup_status=1
     else
-      usermod --del-subuids "${subuid_start}-${subuid_end}" "$user" >/dev/null 2>&1 || cleanup_status=1
-      usermod --del-subgids "${subgid_start}-${subgid_end}" "$user" >/dev/null 2>&1 || cleanup_status=1
+      if jit_worker_resource_may_exist "$state_file" subids; then
+        usermod --del-subuids "${subuid_start}-${subuid_end}" "$user" >/dev/null 2>&1 || cleanup_status=1
+        usermod --del-subgids "${subgid_start}-${subgid_end}" "$user" >/dev/null 2>&1 || cleanup_status=1
+      fi
       userdel --remove "$user" >/dev/null 2>&1 || cleanup_status=1
     fi
   fi
-  if jit_stage_may_own_group "$creation_stage" && getent group "$group" >/dev/null 2>&1; then
+  if jit_worker_resource_may_exist "$state_file" group && getent group "$group" >/dev/null 2>&1; then
     groupdel "$group" >/dev/null 2>&1 || cleanup_status=1
   fi
   getent passwd "$user" >/dev/null 2>&1 && cleanup_status=1 || true
@@ -978,7 +1048,7 @@ jit_destroy_worker_boundary() {
 }
 
 jit_cleanup_worker_state() {
-  local state_file="$1" user uid group worker_root runner_dir runner_id worker_id admission_id creation_stage cleanup_failed=0 current_pid recorded_pid
+  local state_file="$1" user uid group worker_root runner_dir runner_id worker_id admission_id cleanup_failed=0 current_pid recorded_pid
   [[ -r "$state_file" ]] || return 0
   if [[ "$(jq -r '.sequence // empty' "$state_file")" != "" ]] && ! jit_validate_worker_identity_state "$state_file"; then
     jit_write_worker_state "$state_file" cleanup-pending "Persisted worker identity failed deterministic validation."
@@ -996,11 +1066,11 @@ jit_cleanup_worker_state() {
     jit_terminate_worker_tree "$state_file" || cleanup_failed=1
   fi
   user="$(jq -r '.user // empty' "$state_file")"; uid="$(jq -r '.uid // empty' "$state_file")"
-  group="$(jq -r '.group // empty' "$state_file")"; creation_stage="$(jq -r '.creation_stage // empty' "$state_file")"
+  group="$(jq -r '.group // empty' "$state_file")"
   worker_root="$(jq -r '.root // empty' "$state_file")"; runner_dir="$(jq -r '.runner_dir // empty' "$state_file")"
   runner_id="$(jq -r '.runner_id // empty' "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; admission_id="$(jq -r .admission_id "$state_file")"
   (( cleanup_failed != 0 )) || jit_capture_worker_diagnostics "$admission_id" "$worker_id" "$worker_root" "$runner_dir" "$state_file" || cleanup_failed=1
-  jit_destroy_worker_boundary "$user" "$uid" "$group" "$worker_root" "$creation_stage" "$state_file" || cleanup_failed=1
+  jit_destroy_worker_boundary "$user" "$uid" "$group" "$worker_root" "$state_file" || cleanup_failed=1
   jit_deregister_runner "$runner_id" || cleanup_failed=1
   jit_reconcile_registration "$state_file" cleanup || cleanup_failed=1
   if (( cleanup_failed == 0 )); then

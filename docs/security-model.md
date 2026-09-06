@@ -35,6 +35,8 @@
 - systemd/cgroup-first quiescence, exact persisted process identities, and no traversal authority from stale/reused PIDs;
 - fail-closed worker-journal and stale-admission unit/runtime/exact-label reconciliation;
 - root-locked host/project diagnostic quotas, free-space floor, deterministic TTL/count pruning, and failure-evidence preference;
+- cross-device/mount-ID-safe no-follow diagnostic pruning that never descends into nested mounts;
+- sandboxed/seccomp-filtered slirp services with minimal attach capabilities and inaccessible controller credentials/state;
 - file- and parent-directory-fsynced critical JIT state replacement.
 
 ## Residual risks

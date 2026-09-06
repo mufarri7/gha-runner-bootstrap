@@ -414,10 +414,21 @@ jit_validate_worker_journal() {
   [[ -r "$state_file" && "$expected_admission" =~ ^[0-9a-f]{64}$ ]] || return 1
   expected_worker="$(basename -- "$state_file" .json)"
   [[ "$expected_worker" =~ ^worker-[0-9]{3,}$ ]] || return 1
-  jq -e --argjson schema "$JIT_SCHEMA_VERSION" --arg admission "$expected_admission" --arg worker "$expected_worker" '
+  jq -e --argjson schema "$JIT_WORKER_SCHEMA_VERSION" --arg admission "$expected_admission" --arg worker "$expected_worker" '
+    . as $record |
     .schema_version==$schema and .admission_id==$admission and .worker_id==$worker and
     (.sequence|type=="number" and floor==. and .>=1) and
     (.status|type=="string" and test("^(allocated|creating|boundary-ready|registration-requested|registered|running|cancelled|cleanup-pending|cleaned|finished|failed)$")) and
+    ($record.resources|type=="object") and
+    (["boundary","group","user","subids","runner_seed","runtime"] | all(.[]; . as $resource |
+      ($record.resources[$resource]|type=="object") and
+      ($record.resources[$resource].mutation_started|type=="boolean") and
+      ($record.resources[$resource].created|type=="boolean"))) and
+    (["sandbox_unit","network_unit"] | all(.[]; . as $resource |
+      ($record.resources[$resource]|type=="object") and
+      ($record.resources[$resource].mutation_started|type=="boolean") and
+      ($record.resources[$resource].created|type=="boolean") and
+      ($record.resources[$resource].identity_persisted|type=="boolean"))) and
     (.controller_children|type=="array" and all(.[];
       (.pid|type=="number" and floor==. and .>=1) and
       (.boot_id|type=="string" and length>0) and

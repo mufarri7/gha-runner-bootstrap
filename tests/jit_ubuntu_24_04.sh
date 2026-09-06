@@ -36,6 +36,7 @@ cleanup_test_host() {
   done
   shopt -u nullglob
   mountpoint -q "$GHRCTL_LOG_DIR/tiny" 2>/dev/null && umount "$GHRCTL_LOG_DIR/tiny"
+  mountpoint -q "$GHRCTL_LOG_DIR/retention-mount/admission/worker/nested" 2>/dev/null && umount "$GHRCTL_LOG_DIR/retention-mount/admission/worker/nested"
   rm -rf --one-file-system "$GHRCTL_STATE_DIR" "$GHRCTL_DATA_DIR" "$GHRCTL_LOG_DIR" "$GHRCTL_BASE_ROOT"
   rm -f "$GHRCTL_LOCK_FILE"
 }
@@ -53,7 +54,7 @@ jit_stage_runtime_helper staged_runtime_helper staged_runtime_manifest
 [[ "$(stat -c '%u:%a' "$staged_runtime_helper")" == 0:* ]] || { printf 'Staged JIT helper is not root-owned.\n' >&2; exit 1; }
 jq -e --arg revision "$(jit_runtime_controller_revision)" --arg helper "$staged_runtime_helper" \
   --arg helper_sha256 "$(sha256sum "$staged_runtime_helper" | awk '{print $1}')" \
-  '.schema_version == 1 and (.controller_manifest.files|length)==6 and .controller_revision == $revision and .helper == $helper and .helper_sha256 == $helper_sha256' \
+  '.schema_version == 1 and (.controller_manifest.files|length)==7 and .controller_revision == $revision and .helper == $helper and .helper_sha256 == $helper_sha256' \
   "$staged_runtime_manifest" >/dev/null || { printf 'JIT runtime manifest is not bound to the staged helper.\n' >&2; exit 1; }
 JIT_ADMISSION_RUNTIME_HELPER="$staged_runtime_helper"
 JIT_ADMISSION_RUNTIME_MANIFEST="$staged_runtime_manifest"
@@ -133,6 +134,20 @@ for _attempt in $(seq 1 300); do
   sleep 0.1
 done
 [[ "$main_one" =~ ^[1-9][0-9]*$ && "$main_two" =~ ^[1-9][0-9]*$ ]] || { printf 'Worker sandbox namespaces did not start.\n' >&2; exit 1; }
+for _attempt in $(seq 1 300); do
+  slirp_one="$(jq -r '.sandbox_slirp_pid // 0' "$state_one")"; slirp_two="$(jq -r '.sandbox_slirp_pid // 0' "$state_two")"
+  [[ "$slirp_one" =~ ^[1-9][0-9]*$ && "$slirp_two" =~ ^[1-9][0-9]*$ ]] && break
+  sleep 0.1
+done
+[[ "$slirp_one" =~ ^[1-9][0-9]*$ && "$slirp_two" =~ ^[1-9][0-9]*$ ]] || { printf 'Hardened network helpers did not become ready.\n' >&2; exit 1; }
+network_unit_one="$(jq -r .sandbox_network_unit "$state_one")"
+[[ "$(systemctl show --property=User --value "$network_unit_one")" == root ]]
+[[ "$(systemctl show --property=NoNewPrivileges --value "$network_unit_one")" == yes ]]
+[[ "$(systemctl show --property=ProtectHome --value "$network_unit_one")" == yes ]]
+[[ "$(systemctl show --property=ProtectSystem --value "$network_unit_one")" == strict ]]
+systemctl show --property=CapabilityBoundingSet --value "$network_unit_one" | grep -qw CAP_SYS_ADMIN
+systemctl show --property=CapabilityBoundingSet --value "$network_unit_one" | grep -qw CAP_NET_ADMIN
+nsenter --target "$main_one" --net -- curl --fail --silent --max-time 15 https://api.github.com/zen >/dev/null
 for namespace in net mnt ipc; do
   [[ "$(readlink "/proc/${main_one}/ns/${namespace}")" != "$(readlink "/proc/${main_two}/ns/${namespace}")" ]] || { printf 'Workers share %s namespace.\n' "$namespace" >&2; exit 1; }
 done
@@ -180,9 +195,19 @@ for _attempt in $(seq 1 300); do reuse_main="$(jq -r '.sandbox_main_pid // 0' "$
 for private_path in /tmp/slot-one-private /var/tmp/slot-one-private /dev/shm/slot-one-private; do nsenter --target "$reuse_main" --mount -- test ! -e "$private_path"; done
 jit_cleanup_worker_state "$reuse_state"; wait "$reuse_execute" >/dev/null 2>&1 || true
 
+# Faults after boundary creation use a deterministic test-only JIT payload. The
+# guarded suite must never call GitHub's live generate-jitconfig endpoint.
+jit_generate_config() {
+  JIT_GENERATED_CONFIG=aml0LWRlc3RydWN0aXZlLXRlc3QtY29uZmln
+  JIT_GENERATED_RUNNER_ID=""
+}
+jit_reconcile_registration() { return 0; }
+
 fault_points=(
   worker-after-boundary-mutation worker-after-group-mutation worker-after-user-mutation worker-after-subids-mutation
   worker-after-runner-seed-mutation worker-after-sandbox-mutation
+  worker-after-main-pid-persisted worker-before-nsenter worker-after-nsenter worker-after-network-unit-created
+  worker-before-network-readiness worker-before-slirp-identity-persisted worker-after-sandbox-start
 )
 fault_sequence=3
 for fault_point in "${fault_points[@]}"; do
@@ -200,23 +225,16 @@ for fault_point in "${fault_points[@]}"; do
   wait "$fault_pid" >/dev/null 2>&1 || true
   [[ "$(jq -r .status "$state_file")" == failed ]] || { printf 'Fault path did not terminate through jit_worker_process at %s.\n' "$fault_point" >&2; exit 1; }
   fault_user="$(jq -r .user "$state_file")"; fault_root="$(jq -r .root "$state_file")"; fault_runtime="$(jq -r .runtime_dir "$state_file")"
+  fault_unit="$(jq -r .sandbox_unit "$state_file")"; fault_network_unit="$(jq -r .sandbox_network_unit "$state_file")"
   jit_cleanup_worker_state "$state_file"
   if id "$fault_user" >/dev/null 2>&1 || getent group "$fault_user" >/dev/null 2>&1 || grep -qE "^${fault_user}:" /etc/subuid /etc/subgid; then
     printf 'Identity state survived fault cleanup at %s.\n' "$fault_point" >&2
     exit 1
   fi
   [[ ! -e "$fault_root" && ! -e "$fault_runtime" ]]
+  ! systemctl is-active --quiet "$fault_unit" && ! systemctl is-active --quiet "$fault_network_unit"
   fault_sequence=$((fault_sequence + 1))
 done
-
-sandbox_fault_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-050)"
-jit_write_worker_state "$sandbox_fault_state" allocated; jit_plan_worker_identity "$sandbox_fault_state" 50; jit_create_worker_boundary "$sandbox_fault_state"
-GHRCTL_JIT_FAULT_POINT=worker-after-sandbox-start
-if (jit_execute_runner "$sandbox_fault_state" jit-destructive-sandbox-fault); then printf 'Sandbox-start fault injection did not fire.\n' >&2; exit 1; fi
-unset GHRCTL_JIT_FAULT_POINT
-sandbox_fault_unit="$(jq -r .sandbox_unit "$sandbox_fault_state")"; sandbox_fault_network_unit="$(jq -r .sandbox_network_unit "$sandbox_fault_state")"
-jit_cleanup_worker_state "$sandbox_fault_state"
-! systemctl is-active --quiet "$sandbox_fault_unit" && ! systemctl is-active --quiet "$sandbox_fault_network_unit"
 
 
 diagnostic_root="${JIT_BOUNDARY_ROOT}/${JIT_ADMISSION_ID}/diagnostic-abuse.boundary"
@@ -245,6 +263,21 @@ mkdir -p "$diagnostic_root/disk" "$GHRCTL_LOG_DIR/tiny"; dd if=/dev/zero of="$di
 mount -t tmpfs -o size=1M tmpfs "$GHRCTL_LOG_DIR/tiny"
 if python3 "$ROOT/libexec/collect_diagnostics.py" --boundary "$diagnostic_root" --source "$diagnostic_root/disk" --destination "$GHRCTL_LOG_DIR/tiny/copy" --max-files 200 --max-file-bytes 4194304 --max-total-bytes 33554432; then printf 'Disk-exhaustion diagnostic copy succeeded unexpectedly.\n' >&2; exit 1; fi
 [[ ! -e "$GHRCTL_LOG_DIR/tiny/copy" ]]; umount "$GHRCTL_LOG_DIR/tiny"
+
+retention_mount_root="$GHRCTL_LOG_DIR/retention-mount"
+mkdir -p "$retention_mount_root/admission/worker/nested"
+printf ordinary >"$retention_mount_root/admission/worker/evidence.log"
+jit_write_diagnostic_retention_marker "$retention_mount_root/admission/worker" destructive-test admission worker finished 0
+mount -t tmpfs -o size=1M tmpfs "$retention_mount_root/admission/worker/nested"
+printf sentinel >"$retention_mount_root/admission/worker/nested/sentinel"
+if python3 "$ROOT/libexec/prune_diagnostics.py" --root "$retention_mount_root" --project destructive-test \
+  --host-max-bytes 1048576 --project-max-bytes 1048576 --min-free-bytes 0 --retention-seconds 86400 \
+  --project-max-workers 0 --now-epoch "$(date +%s)" >/dev/null 2>&1; then
+  printf 'Diagnostic pruner crossed a nested mount.\n' >&2
+  exit 1
+fi
+[[ "$(<"$retention_mount_root/admission/worker/nested/sentinel")" == sentinel ]] || { printf 'Mounted diagnostic sentinel was deleted.\n' >&2; exit 1; }
+umount "$retention_mount_root/admission/worker/nested"
 trap - EXIT
 cleanup_test_host
 printf 'Destructive Ubuntu 24.04 worker-boundary test passed.\n'

@@ -24,6 +24,7 @@ BASE_ROOT="${GHRCTL_BASE_ROOT:-/srv/github-runners}"
 DEFAULT_SHARED_LABEL="shared-ci"
 GITHUB_API_VERSION="2026-03-10"
 JIT_SCHEMA_VERSION=2
+JIT_WORKER_SCHEMA_VERSION=3
 JIT_SYSTEM_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 JIT_API_PAGE_SIZE=100
 JIT_API_MAX_PAGES=1000

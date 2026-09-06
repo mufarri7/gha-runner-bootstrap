@@ -33,6 +33,22 @@ if (jit_validate_policy_json "$INVALID_POOL_POLICY" >/dev/null 2>&1); then fail 
 jq . "$TEST_POLICY" | jit_atomic_write "$(jit_policy_file mazaya-test)"
 jit_load_policy mazaya-test
 
+# Force the production validator without invoking any production mutation.
+(
+  GHRCTL_JIT_HOST_BACKEND=production
+  production_admission=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+  production_worker=worker-001
+  production_runtime="${JIT_WORKER_RUNTIME_ROOT}/$(jit_worker_runtime_id "$production_admission" "$production_worker")"
+  jit_validate_worker_runtime_socket "$production_runtime" "$production_runtime/docker.sock" "$production_admission" "$production_worker" \
+    || fail "production runtime validator rejected the deterministic runtime identity"
+  if jit_validate_worker_runtime_socket "${JIT_WORKER_RUNTIME_ROOT}/abcdef123456-002" "${JIT_WORKER_RUNTIME_ROOT}/abcdef123456-002/docker.sock" "$production_admission" "$production_worker"; then
+    fail "production runtime validator accepted a deterministic sibling identity"
+  fi
+  if jit_validate_worker_runtime_socket "${JIT_WORKER_RUNTIME_ROOT}/abcdef1234560001" "${JIT_WORKER_RUNTIME_ROOT}/abcdef1234560001/docker.sock" "$production_admission" "$production_worker"; then
+    fail "production runtime validator accepted the obsolete runtime identity shape"
+  fi
+)
+
 JIT_TEST_EVIDENCE_DIR="$TMP/evidence"
 JIT_TEST_EVIDENCE_ARCHIVE="$TMP/evidence.zip"
 JIT_TEST_BAD_EVIDENCE_ARCHIVE="$TMP/evidence-bad.zip"
@@ -389,6 +405,18 @@ python3 "$ROOT/libexec/prune_diagnostics.py" --root "$retention_root" --project 
   --host-max-bytes 1048576 --project-max-bytes 1048576 --min-free-bytes 0 --retention-seconds 1 \
   --project-max-workers 100 --now-epoch "$(date +%s)"
 [[ ! -e "$retention_root/admission-c/worker-expired" ]] || fail "diagnostic TTL pruning failed"
+retention_sentinel="$TMP/retention-sentinel"
+printf sentinel >"$retention_sentinel"
+mkdir -p "$retention_root/admission-d/worker-unsafe"
+jit_write_diagnostic_retention_marker "$retention_root/admission-d/worker-unsafe" mazaya-test admission-d worker-unsafe finished 0
+ln -s "$retention_sentinel" "$retention_root/admission-d/worker-unsafe/nested-link"
+if python3 "$ROOT/libexec/prune_diagnostics.py" --root "$retention_root" --project mazaya-test \
+  --host-max-bytes 1048576 --project-max-bytes 1048576 --min-free-bytes 0 --retention-seconds 86400 \
+  --project-max-workers 1 --now-epoch "$(date +%s)" >/dev/null 2>&1; then
+  fail "diagnostic pruner accepted a no-follow retention violation"
+fi
+[[ "$(<"$retention_sentinel")" == sentinel ]] || fail "diagnostic pruning followed an unsafe retention entry"
+rm "$retention_root/admission-d/worker-unsafe/nested-link"
 jit_acquire_diagnostic_retention_lock retention_test_fd
 assert_eq "$(stat -c '%a' "$JIT_DIAGNOSTIC_RETENTION_LOCK_FILE")" 600
 jit_release_diagnostic_retention_lock "$retention_test_fd"
@@ -579,8 +607,12 @@ lease_worker="$(jit_worker_state_file "$lease_a" worker-901)"
 jit_write_worker_state "$lease_worker" allocated
 jit_plan_worker_identity "$lease_worker" 901
 valid_lease_worker="$(cat "$lease_worker")"
+assert_eq "$(jq -r '.schema_version' "$lease_worker")" "$JIT_WORKER_SCHEMA_VERSION" "new worker journals should use the resource-checkpoint schema"
 printf '{"schema_version":' >"$lease_worker"
 if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "truncated worker journal failed open"; fi
+printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
+jq --argjson old_schema "$JIT_SCHEMA_VERSION" '.schema_version=$old_schema' "$lease_worker" | jit_atomic_write "$lease_worker"
+if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "legacy worker journal schema failed open"; fi
 printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
 jq '.schema_version=999' "$lease_worker" | jit_atomic_write "$lease_worker"
 if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "unknown worker journal schema failed open"; fi
@@ -588,10 +620,13 @@ printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
 jq '.status="future-status"' "$lease_worker" | jit_atomic_write "$lease_worker"
 if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "unknown worker journal status failed open"; fi
 printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
-jq '.sandbox_unit="attacker-selected.service"' "$lease_worker" | jit_atomic_write "$lease_worker"
-if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "invalid deterministic worker identity failed open"; fi
-printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
-jq '.root=null' "$lease_worker" | jit_atomic_write "$lease_worker"
+  jq '.sandbox_unit="attacker-selected.service"' "$lease_worker" | jit_atomic_write "$lease_worker"
+  if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "invalid deterministic worker identity failed open"; fi
+  printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
+  jq '.resources.user.mutation_started="yes"' "$lease_worker" | jit_atomic_write "$lease_worker"
+  if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "malformed resource checkpoint failed open"; fi
+  printf '%s\n' "$valid_lease_worker" | jit_atomic_write "$lease_worker"
+  jq '.root=null' "$lease_worker" | jit_atomic_write "$lease_worker"
 if (jit_assert_active_admission_available "$lease_b" >/dev/null 2>&1); then fail "missing required worker identity failed open"; fi
 rm -f "$lease_worker"
 
@@ -640,6 +675,9 @@ for fault_point in "${worker_fault_points[@]}"; do
   assert_eq "$(jq -r .status "$fault_state")" failed
   jq -e '.creation_stage!=null and .user!=null and .uid!=null and .group!=null and .root!=null and .home!=null and .runtime_dir!=null and .docker_socket!=null' "$fault_state" >/dev/null \
     || fail "partial worker identity was not journaled before fault: $fault_point"
+  jq -e '.resources.boundary.mutation_started==true and
+    ([.resources.boundary,.resources.group,.resources.user,.resources.subids,.resources.runner_seed,.resources.runtime] | all(.mutation_started|type=="boolean") and all(.created|type=="boolean"))' "$fault_state" >/dev/null \
+    || fail "durable resource checkpoints were not preserved before fault cleanup: $fault_point"
   fault_root="$(jq -r .root "$fault_state")"
   fault_runtime="$(jq -r .runtime_dir "$fault_state")"
   jit_cleanup_worker_state "$fault_state"

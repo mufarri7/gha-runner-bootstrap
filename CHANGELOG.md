@@ -19,6 +19,8 @@ The project follows semantic versioning after `1.0.0`. Pre-1.0 beta versions may
 - PID-reuse-safe process cleanup with persisted sandbox MainPID/slirp identities and systemd/cgroup-first production teardown.
 - Strict worker-journal launch gating plus stale-admission unit, runtime-path, and exact-label remote-runner reconciliation.
 - Root-locked host/project diagnostic quotas, minimum-free-space preflight, deterministic TTL/count pruning, and failure-evidence preference.
+- Exact deterministic production runtime IDs and a versioned, fail-closed resource-checkpoint schema across MainPID/network/slirp setup.
+- Cross-device, mount-inventory, and descriptor-safe diagnostics pruning plus sandboxed/seccomp-filtered network helpers.
 - Corrected `mazaya-backend` policy with case-insensitive project-derived reusable-label quarantine.
 - Fake lifecycle/security tests plus a guarded Ubuntu 24.04 destructive test and pre-stable validation plan.
 

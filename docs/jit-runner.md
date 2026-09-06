@@ -148,13 +148,16 @@ the persisted root PID, boot ID, and start ticks match both before and after the
 snapshot; a stale or reused root grants no traversal authority. Sandbox MainPID
 and slirp PID, boot ID, and start ticks are persisted independently and are
 never reconstructed from current `/proc` metadata. Creation checkpoints
-the boundary, group, user, subordinate IDs, runner seed, and sandbox preparation.
+each resource with durable `mutation_started` and `created` booleans before and
+after the boundary, group, user, subordinate-ID, runner-seed, runtime, sandbox
+unit, and network-unit mutations. Cleanup consumes those resource facts rather
+than inferring ownership from a descriptive creation-stage string.
 The allocator parses every record in `/etc/passwd`, `/etc/group`, `/etc/subuid`,
 and `/etc/subgid`; malformed, overlapping, occupied, or cross-pool maps fail
 closed. Cleanup uses the journaled snapshot, so later policy drift cannot make a
 partially-created identity unrecognizable.
 
-The runner and its dedicated Rootless Docker daemon execute in one transient systemd boundary with private network, mount, `/tmp`, `/var/tmp`, `/dev/shm`, and IPC namespaces. `slirp4netns --disable-host-loopback` provides controlled egress without exposing the host loopback. The unit hides host homes and Docker sockets, restricts writable paths to the worker boundary, and is killed as one cgroup. Each slot therefore has distinct loopback services, temporary files, shared memory, IPC objects, home, daemon socket, and Docker data root. Identity teardown (`usermod`, `userdel`, `groupdel`, subordinate-map removal) and its final map/mount validation take the same host-mutation lock as allocation, so a replacement cannot observe a half-removed worker. Workers use exactly:
+The runner and its dedicated Rootless Docker daemon execute in one transient systemd boundary with private network, mount, `/tmp`, `/var/tmp`, `/dev/shm`, and IPC namespaces. A separate deterministic root systemd service attaches `slirp4netns` to that namespace with only `CAP_SYS_ADMIN` and `CAP_NET_ADMIN` in its bounding set. Launch fails unless the installed build advertises both sandbox and libseccomp support; the helper runs with `--enable-sandbox`, `--enable-seccomp`, and `--disable-host-loopback`. `NoNewPrivileges`, strict system/home protection, private mounts and temporary storage, bounded address families, and inaccessible controller state, logs, application key, root home, and host Docker sockets limit its host view. Before processing traffic, the unit verifies those paths are unreadable and then replaces its environment with the fixed system-only PATH. The worker unit hides host homes and Docker sockets, restricts writable paths to the worker boundary, and is killed as one cgroup. Each slot therefore has distinct loopback services, temporary files, shared memory, IPC objects, home, daemon socket, and Docker data root. Identity teardown (`usermod`, `userdel`, `groupdel`, subordinate-map removal) and its final map/mount validation take the same host-mutation lock as allocation, so a replacement cannot observe a half-removed worker. Workers use exactly:
 
 ```text
 /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -171,6 +174,10 @@ pruning enforces a 4 GiB host quota, 1 GiB per-project quota, 2 GiB minimum free
 space, 14-day TTL, and 100 retained workers per project by default. Successful
 evidence is pruned before failure/cancellation/cleanup-pending evidence; active
 reservations and malformed retention metadata are never pruned automatically.
+Inventory pins every retained entry to the retention root device and rejects
+mount points from `/proc/self/mountinfo`. Pruning repeats that validation, then
+deletes through no-follow directory descriptors while checking inode, device,
+and kernel mount ID, so a nested bind mount or filesystem is never traversed.
 Operators may set `GHRCTL_JIT_DIAGNOSTIC_HOST_MAX_BYTES`,
 `GHRCTL_JIT_DIAGNOSTIC_PROJECT_MAX_BYTES`,
 `GHRCTL_JIT_DIAGNOSTIC_MIN_FREE_BYTES`,
