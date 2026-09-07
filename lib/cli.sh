@@ -84,6 +84,15 @@ Usage:
   sudo ./ghrctl [global options] export-manifest [slug]
   sudo ./ghrctl [global options] restore-manifest FILE
   sudo ./ghrctl [global options] adopt [base-directory]
+  sudo ./ghrctl [global options] jit install-policy FILE
+  sudo ./ghrctl [global options] jit prepare <project> --run-id ID --run-attempt N --pr-number N --base-sha SHA --head-sha SHA --merge-sha SHA --tree-sha SHA --label LABEL [--auth gh|token|app]
+  sudo ./ghrctl [global options] jit launch <admission-id> [--slots N] [--auth gh|token|app]
+  sudo ./ghrctl [global options] jit status <admission-id>
+  sudo ./ghrctl [global options] jit cleanup <admission-id> [--auth gh|token|app]
+  sudo ./ghrctl [global options] jit resume <admission-id> [--slots N] [--auth gh|token|app]
+  sudo ./ghrctl [global options] jit migration-plan <project> [--auth gh|token|app]
+  sudo ./ghrctl [global options] jit quarantine-persistent <project> [--timeout SECONDS] [--auth gh|token|app]
+  sudo ./ghrctl [global options] jit rollback <project> [--auth gh|token|app]
   sudo ./ghrctl [global options] resume
   sudo ./ghrctl [global options] swap-policy
   sudo ./ghrctl self-update
@@ -143,6 +152,7 @@ dispatch_command() {
     export-manifest) export_manifest "${1:-}" ;;
     restore-manifest) restore_manifest "${1:-}" ;;
     adopt) adopt_existing "${1:-$BASE_ROOT}" ;;
+    jit) jit_command "$@" ;;
     resume) resume_last_operation ;;
     swap-policy) swap_policy_json | { if (( JSON_OUTPUT == 1 )); then cat; else jq .; fi; } ;;
     migrate-state) need_root; migrate_legacy_state ;;

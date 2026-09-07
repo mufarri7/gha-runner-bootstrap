@@ -16,6 +16,14 @@ source "${GHRCTL_ROOT}/lib/scanner.sh"
 source "${GHRCTL_ROOT}/lib/project.sh"
 # shellcheck source=lib/runner.sh
 source "${GHRCTL_ROOT}/lib/runner.sh"
+# shellcheck source=lib/jit_admission.sh
+source "${GHRCTL_ROOT}/lib/jit_admission.sh"
+# shellcheck source=lib/jit_evidence.sh
+source "${GHRCTL_ROOT}/lib/jit_evidence.sh"
+# shellcheck source=lib/jit_worker.sh
+source "${GHRCTL_ROOT}/lib/jit_worker.sh"
+# shellcheck source=lib/jit_migration.sh
+source "${GHRCTL_ROOT}/lib/jit_migration.sh"
 # shellcheck source=lib/operations.sh
 source "${GHRCTL_ROOT}/lib/operations.sh"
 # shellcheck source=lib/backup.sh

@@ -1,7 +1,7 @@
 install_base_packages() {
   info "Installing host packages (idempotent)..."
   if (( DRY_RUN == 1 )); then
-    log "DRY-RUN apt-get install: ca-certificates curl wget git jq unzip zip tar gzip xz-utils zstd rsync build-essential gnupg lsb-release acl htop tmux tree ufw fail2ban sysstat uidmap dbus-user-session slirp4netns fuse-overlayfs iptables xvfb xauth python3 python3-venv"
+    log "DRY-RUN apt-get install: ca-certificates curl wget git jq unzip zip tar gzip xz-utils zstd rsync build-essential gnupg lsb-release acl htop tmux tree ufw fail2ban sysstat uidmap dbus-user-session slirp4netns fuse-overlayfs iproute2 iptables xvfb xauth python3 python3-venv"
     return 0
   fi
   export DEBIAN_FRONTEND=noninteractive
@@ -9,7 +9,7 @@ install_base_packages() {
   apt-get install -y \
     ca-certificates curl wget git jq unzip zip tar gzip xz-utils zstd rsync \
     build-essential gnupg lsb-release acl htop tmux tree ufw fail2ban sysstat \
-    uidmap dbus-user-session slirp4netns fuse-overlayfs iptables xvfb xauth \
+    uidmap dbus-user-session slirp4netns fuse-overlayfs iproute2 iptables xvfb xauth \
     python3 python3-venv
   apt-get install -y gh >/dev/null 2>&1 || warn "GitHub CLI (gh) was not available from the OS repository; paste/PAT modes still work."
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
@@ -171,7 +171,7 @@ user_systemctl() {
   local user="$1"; shift
   local uid home
   uid="$(id -u "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"
-  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user "$@"
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" systemctl --user "$@"
 }
 
 ensure_rootless_docker() {
@@ -182,11 +182,11 @@ ensure_rootless_docker() {
   if user_systemctl "$user" is-active docker >/dev/null 2>&1; then success "Rootless Docker already active for $user."
   else
     info "Installing rootless Docker for $user..."
-    runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" dockerd-rootless-setuptool.sh install --force
+    runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" dockerd-rootless-setuptool.sh install --force
     user_systemctl "$user" daemon-reload
     user_systemctl "$user" enable --now docker
   fi
-  runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" DOCKER_HOST="unix:///run/user/${uid}/docker.sock" docker info --format '{{json .SecurityOptions}}' | grep -qi rootless || die "Docker daemon for $user is not rootless."
+  runuser -u "$user" -- env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" XDG_RUNTIME_DIR="/run/user/${uid}" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" DOCKER_HOST="unix:///run/user/${uid}/docker.sock" docker info --format '{{json .SecurityOptions}}' | grep -qi rootless || die "Docker daemon for $user is not rootless."
   success "Verified rootless Docker for $user."
 }
 
@@ -198,4 +198,3 @@ public_repo_warning() {
     confirm "I understand the risk and still want to register a persistent runner" "N" || die "Cancelled. Prefer a private repository or ephemeral/JIT isolation."
   fi
 }
-

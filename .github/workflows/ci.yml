@@ -6,6 +6,7 @@ on:
   pull_request:
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -13,12 +14,35 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y shellcheck jq zstd
       - name: Bash syntax
-        run: bash -n ghrctl lib/*.sh tests/test.sh
+        run: bash -n ghrctl lib/*.sh libexec/*.sh tests/*.sh tests/fixtures/*/run.sh
+      - name: Python syntax
+        run: python3 -m py_compile libexec/*.py
       - name: ShellCheck
-        run: shellcheck -x ghrctl tests/test.sh
+        run: shellcheck -x ghrctl libexec/*.sh tests/test.sh tests/live_artifact_test.sh tests/jit_candidate_boundary_probe.sh tests/jit_ubuntu_24_04.sh tests/fixtures/*/run.sh
       - name: Functional tests
-        run: sudo ./tests/test.sh
+        run: ./tests/test.sh
+      - name: Prepare live admission artifact fixture
+        id: live-evidence
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./tests/live_artifact_test.sh prepare
+      - name: Upload immutable live admission artifact fixture
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.live-evidence.outputs.artifact_name }}
+          path: ${{ steps.live-evidence.outputs.evidence_path }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+          overwrite: false
+      - name: Verify live admission artifact through GitHub REST
+        env:
+          EXPECTED_ARTIFACT_NAME: ${{ steps.live-evidence.outputs.artifact_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./tests/live_artifact_test.sh verify

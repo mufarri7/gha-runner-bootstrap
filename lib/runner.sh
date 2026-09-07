@@ -11,6 +11,21 @@ latest_runner_release() {
   printf '%s\t%s\t%s\t%s\n' "$version" "$asset" "$url" "$digest"
 }
 
+runner_release_by_version() {
+  local version="$1" arch="$2" json asset count url digest
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid pinned runner release version."
+  json="$(curl -fsSL --retry 3 "https://api.github.com/repos/actions/runner/releases/tags/v${version}")" \
+    || die "Unable to query the pinned GitHub Actions runner release."
+  jq -e --arg tag "v${version}" '.tag_name==$tag and .draft==false and .prerelease==false' <<<"$json" >/dev/null \
+    || die "Pinned runner release metadata does not match the reviewed tag."
+  asset="actions-runner-linux-${arch}-${version}.tar.gz"
+  count="$(jq --arg asset "$asset" '[.assets[] | select(.name==$asset)] | length' <<<"$json")"
+  [[ "$count" == 1 ]] || die "Pinned runner release must contain exactly one expected asset."
+  url="$(jq -r --arg asset "$asset" '.assets[] | select(.name==$asset) | .browser_download_url' <<<"$json")"
+  digest="$(jq -r --arg asset "$asset" '.assets[] | select(.name==$asset) | (.digest // "")' <<<"$json")"
+  printf '%s\t%s\t%s\t%s\n' "$version" "$asset" "$url" "$digest"
+}
+
 get_api_auth_mode() {
   local mode="$1" repo_full="$2" endpoint="$3" token response
   case "$mode" in
@@ -140,8 +155,18 @@ verify_runner_online_if_possible() {
   local repo_full="$1" runner_name="$2" json
   if have gh && gh auth status >/dev/null 2>&1; then
     for _ in 1 2 3 4 5 6; do
-      json="$(gh api "repos/${repo_full}/actions/runners" --paginate --slurp 2>/dev/null || true)"
-      if [[ -n "$json" ]] && jq -e --arg name "$runner_name" '[.[][]?.runners[]?]|any(.name==$name and .status=="online")' >/dev/null <<<"$json"; then
+      json="$(gh api "repos/${repo_full}/actions/runners?per_page=100" --paginate 2>/dev/null | jq -sc '
+        if length==0 or any(.[]; (.total_count|type)!="number" or (.runners|type)!="array") then error("invalid runner collection")
+        elif ([.[].total_count] | unique | length)!=1 then error("runner total changed")
+        else
+          .[0].total_count as $total | [.[].runners[]] as $runners |
+          if ($runners|length)!=$total then error("runner collection truncated")
+          elif (all($runners[]; (.id|type)=="number" and (.id|floor)==.id and .id>0) | not) then error("invalid runner identity")
+          elif ([$runners[].id]|length)!=([$runners[].id]|unique|length) then error("duplicate runner identity")
+          else {total_count:$total,runners:$runners} end
+        end
+      ' || true)"
+      if [[ -n "$json" ]] && jq -e --arg name "$runner_name" '.runners|any(.name==$name and .status=="online")' >/dev/null <<<"$json"; then
         success "GitHub API reports runner online: $runner_name"; return 0
       fi
       sleep 5

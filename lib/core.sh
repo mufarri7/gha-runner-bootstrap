@@ -22,7 +22,65 @@ LOG_FILE="${GHRCTL_LOG_FILE:-${LOG_DIR}/ghrctl.jsonl}"
 LOCK_FILE="${GHRCTL_LOCK_FILE:-/var/lock/ghrctl.lock}"
 BASE_ROOT="${GHRCTL_BASE_ROOT:-/srv/github-runners}"
 DEFAULT_SHARED_LABEL="shared-ci"
-GITHUB_API_VERSION="2022-11-28"
+GITHUB_API_VERSION="2026-03-10"
+JIT_SCHEMA_VERSION=2
+JIT_ADMISSION_SCHEMA_VERSION=3
+JIT_EVIDENCE_SCHEMA_VERSION=2
+JIT_WORKER_SCHEMA_VERSION=3
+JIT_WORKLOAD_BOUNDARY_SCHEMA_VERSION=1
+JIT_PINNED_RUNNER_VERSION="2.337.0"
+JIT_PINNED_RUNNER_X64_SHA256="70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+JIT_PINNED_RUNNER_ARM64_SHA256="9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393"
+JIT_PINNED_RUNNER_ARM_SHA256="3ea05289b7f7e1bc9a7bb35e2f738a903e0f757cb27ed32a3ef701404cf6d8e8"
+JIT_CONFIG_MAX_ENCODED_BYTES=4194304
+JIT_SLIRP_STARTUP_CAPABILITIES="CAP_SETPCAP CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_PTRACE CAP_SYS_ADMIN"
+JIT_SLIRP_STARTUP_CAPABILITY_NUMBERS=$'CAP_SETPCAP:8\nCAP_NET_BIND_SERVICE:10\nCAP_NET_ADMIN:12\nCAP_SYS_PTRACE:19\nCAP_SYS_ADMIN:21'
+JIT_SLIRP_STARTUP_CAP_MASK="0000000000281500"
+JIT_SLIRP_RUNTIME_CAP_MASK="0000000000000400"
+JIT_EMPTY_CAP_MASK="0000000000000000"
+JIT_SYSTEM_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+JIT_API_PAGE_SIZE=100
+JIT_API_MAX_PAGES=1000
+JIT_API_CONNECT_TIMEOUT_SECONDS=15
+JIT_API_REQUEST_TIMEOUT_SECONDS=60
+JIT_REGISTRATION_RECONCILE_SECONDS=30
+JIT_EVIDENCE_MAX_ARCHIVE_BYTES=65536
+JIT_EVIDENCE_MAX_JSON_BYTES=16384
+JIT_DIAGNOSTIC_MAX_FILES=200
+JIT_DIAGNOSTIC_MAX_FILE_BYTES=4194304
+JIT_DIAGNOSTIC_MAX_TOTAL_BYTES=33554432
+JIT_DIAGNOSTIC_HOST_MAX_BYTES="${GHRCTL_JIT_DIAGNOSTIC_HOST_MAX_BYTES:-4294967296}"
+JIT_DIAGNOSTIC_PROJECT_MAX_BYTES="${GHRCTL_JIT_DIAGNOSTIC_PROJECT_MAX_BYTES:-1073741824}"
+JIT_DIAGNOSTIC_MIN_FREE_BYTES="${GHRCTL_JIT_DIAGNOSTIC_MIN_FREE_BYTES:-2147483648}"
+JIT_DIAGNOSTIC_RETENTION_SECONDS="${GHRCTL_JIT_DIAGNOSTIC_RETENTION_SECONDS:-1209600}"
+JIT_DIAGNOSTIC_PROJECT_MAX_WORKERS="${GHRCTL_JIT_DIAGNOSTIC_PROJECT_MAX_WORKERS:-100}"
+JIT_POLICY_DIR="${STATE_DIR}/jit.d"
+JIT_DATA_DIR="${DATA_DIR}/jit"
+JIT_ADMISSIONS_DIR="${JIT_DATA_DIR}/admissions"
+JIT_WORKERS_DIR="${JIT_DATA_DIR}/workers"
+JIT_RUNNER_CACHE_DIR="${JIT_DATA_DIR}/runner-cache"
+JIT_MIGRATIONS_DIR="${JIT_DATA_DIR}/migrations"
+JIT_DIAGNOSTICS_DIR="${LOG_DIR}/jit"
+JIT_BOUNDARY_ROOT="${GHRCTL_JIT_BOUNDARY_ROOT:-${BASE_ROOT}/.jit}"
+JIT_WORKER_RUNTIME_ROOT="${GHRCTL_JIT_WORKER_RUNTIME_ROOT:-/run/ghrctl-jit}"
+JIT_RUNTIME_DIR="${GHRCTL_JIT_RUNTIME_DIR:-/usr/local/lib/ghrctl/jit-runtime}"
+JIT_RUNTIME_STAGING_LOCK_FILE="${GHRCTL_JIT_RUNTIME_STAGING_LOCK_FILE:-/var/lock/ghrctl-jit-runtime.lock}"
+JIT_ACTIVE_ADMISSION_LEASE_FILE="${GHRCTL_JIT_ACTIVE_ADMISSION_LEASE_FILE:-${JIT_DATA_DIR}/active-admission.json}"
+JIT_DIAGNOSTIC_RETENTION_LOCK_FILE="${GHRCTL_JIT_DIAGNOSTIC_RETENTION_LOCK_FILE:-${JIT_DATA_DIR}/diagnostics-retention.lock}"
+JIT_RUNTIME_HELPER=""
+JIT_RUNTIME_MANIFEST=""
+JIT_RUNTIME_CONTROLLER_MANIFEST=""
+JIT_RUNTIME_CONTROLLER_MANIFEST_SHA256=""
+JIT_RUNNER_SELECTED_VERSION=""
+JIT_RUNNER_SELECTED_ARCH=""
+JIT_RUNNER_SELECTED_ASSET=""
+JIT_RUNNER_SELECTED_DIGEST=""
+JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST=""
+JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256=""
+JIT_ADMISSION_RUNTIME_RUNNER_VERSION=""
+JIT_ADMISSION_RUNTIME_RUNNER_ARCH=""
+JIT_ADMISSION_RUNTIME_RUNNER_ASSET=""
+JIT_ADMISSION_RUNTIME_RUNNER_DIGEST=""
 
 ASSUME_YES=0
 NON_INTERACTIVE=0
@@ -30,6 +88,8 @@ DRY_RUN=0
 JSON_OUTPUT=0
 VERBOSE=0
 LOCK_HELD=0
+JIT_WORKER_HOST_MUTATION_LOCK_FD=""
+JIT_WORKER_EXIT_STATE_FILE=""
 ACTIVE_OPERATION_FILE=""
 
 if [[ -t 1 ]]; then
@@ -51,6 +111,32 @@ debug() {
 }
 
 utc_now() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
+
+jit_process_stat_snapshot() {
+  local pid="$1" stat_line remainder
+  local -a fields=()
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat_line="$(<"/proc/${pid}/stat")" || return 1
+  remainder="${stat_line##*) }"
+  IFS=' ' read -r -a fields <<<"$remainder"
+  ((${#fields[@]} >= 20)) || return 1
+  [[ "${fields[1]}" =~ ^[0-9]+$ && "${fields[19]}" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\t%s\t%s\n' "${fields[0]}" "${fields[1]}" "${fields[19]}"
+}
+
+jit_process_stat_identity() {
+  local snapshot state _parent ticks
+  snapshot="$(jit_process_stat_snapshot "$1")" || return 1
+  IFS=$'\t' read -r state _parent ticks <<<"$snapshot"
+  printf '%s\t%s\n' "$state" "$ticks"
+}
+
+jit_process_start_ticks() {
+  local identity _state ticks
+  identity="$(jit_process_stat_identity "$1")" || return 1
+  IFS=$'\t' read -r _state ticks <<<"$identity"
+  printf '%s' "$ticks"
+}
 
 json_log() {
   local level="${1:-info}" event="${2:-event}" message="${3:-}" extra="${4:-{}}"
@@ -91,6 +177,16 @@ trap on_exit EXIT
 
 have() { command -v "$1" >/dev/null 2>&1; }
 need_root() { [[ ${EUID} -eq 0 ]] || die "This operation must run as root. Re-run it with sudo."; }
+
+durable_replace_file() {
+  local destination="$1" mode="${2:-600}"
+  python3 "${GHRCTL_ROOT}/libexec/durable_replace.py" --mode "$mode" "$destination"
+}
+
+durable_ensure_dir() {
+  local directory="$1" mode="${2:-700}"
+  python3 "${GHRCTL_ROOT}/libexec/durable_directory.py" --mode "$mode" "$directory"
+}
 
 shell_quote_join() {
   local out="" part
@@ -176,8 +272,7 @@ begin_operation() {
     --arg started_at "$(utc_now)" --arg version "$GHRCTL_VERSION" \
     --argjson args "$args_json" \
     '{schema_version:1,id:$id,name:$name,args:$args,status:$status,started_at:$started_at,updated_at:$started_at,ghrctl_version:$version,exit_code:null,note:null}' \
-    >"$ACTIVE_OPERATION_FILE"
-  chmod 600 "$ACTIVE_OPERATION_FILE"
+    | durable_replace_file "$ACTIVE_OPERATION_FILE"
   ln -sfn "$ACTIVE_OPERATION_FILE" "${OPERATIONS_DIR}/last.json"
   json_log info operation_started "Operation started: $name" "$(jq -cn --arg id "$id" --arg name "$name" '{operation_id:$id,operation:$name}')"
 }
@@ -185,12 +280,11 @@ begin_operation() {
 mark_operation() {
   local status="$1" exit_code="${2:-0}" note="${3:-}"
   [[ -n "$ACTIVE_OPERATION_FILE" && -f "$ACTIVE_OPERATION_FILE" ]] || return 0
-  local tmp="${ACTIVE_OPERATION_FILE}.tmp"
   jq \
     --arg status "$status" --arg updated_at "$(utc_now)" --arg note "$note" \
     --argjson exit_code "$exit_code" \
     '.status=$status | .updated_at=$updated_at | .exit_code=$exit_code | .note=(if $note=="" then null else $note end)' \
-    "$ACTIVE_OPERATION_FILE" >"$tmp" && mv "$tmp" "$ACTIVE_OPERATION_FILE"
+    "$ACTIVE_OPERATION_FILE" | durable_replace_file "$ACTIVE_OPERATION_FILE"
 }
 
 resume_last_operation() {
