@@ -279,6 +279,43 @@ jit_verify_system_path() {
   done
 }
 
+jit_validate_slirp_startup_capability_inventory() {
+  local inventory="$1" cap_last="$2" actual
+  [[ "$cap_last" =~ ^[0-9]+$ && "$cap_last" -ge 21 ]] || return 1
+  actual="$(awk 'NR > 1 && NF == 2 { printf "%s:%s\n", toupper($1), $2 }' <<<"$inventory")"
+  [[ "$actual" == "$JIT_SLIRP_STARTUP_CAPABILITY_NUMBERS" ]]
+}
+
+jit_validate_slirp_host_capability_contract() {
+  local inventory cap_last
+  local -a capabilities
+  IFS=' ' read -r -a capabilities <<<"$JIT_SLIRP_STARTUP_CAPABILITIES"
+  inventory="$(systemd-analyze capability "${capabilities[@]}" 2>/dev/null)" || return 1
+  cap_last="$(< /proc/sys/kernel/cap_last_cap)"
+  jit_validate_slirp_startup_capability_inventory "$inventory" "$cap_last"
+}
+
+jit_validate_slirp_capability_status() {
+  local status_file="$1" key value
+  [[ -r "$status_file" ]] || return 1
+  for key in CapInh CapPrm CapEff CapBnd; do
+    value="$(awk -v key="${key}:" '$1 == key && NF == 2 { print tolower($2) }' "$status_file")"
+    [[ "$value" == "$JIT_SLIRP_RUNTIME_CAP_MASK" ]] || return 1
+  done
+  value="$(awk '$1 == "CapAmb:" && NF == 2 { print tolower($2) }' "$status_file")"
+  [[ "$value" == "$JIT_EMPTY_CAP_MASK" ]]
+}
+
+jit_validate_slirp_runtime_capabilities() {
+  local pid="$1" expected_start_ticks="$2" before after
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$expected_start_ticks" =~ ^[1-9][0-9]*$ ]] || return 1
+  before="$(jit_process_start_ticks "$pid" 2>/dev/null)" || return 1
+  [[ "$before" == "$expected_start_ticks" ]] || return 1
+  jit_validate_slirp_capability_status "/proc/${pid}/status" || return 1
+  after="$(jit_process_start_ticks "$pid" 2>/dev/null)" || return 1
+  [[ "$after" == "$expected_start_ticks" ]]
+}
+
 jit_require_clean_host_runtime() {
   local slirp_help slirp_version
   if jit_test_backend_enabled; then
@@ -293,6 +330,9 @@ jit_require_clean_host_runtime() {
   have groupdel || die "groupdel is required for JIT cleanup."
   have python3 || die "Python 3 is required for durable state and bounded diagnostics."
   have systemd-run || die "systemd-run is required for per-worker sandboxing."
+  have systemd-analyze || die "systemd-analyze is required to validate the slirp capability contract."
+  jit_validate_slirp_host_capability_contract \
+    || die "The host cannot provide the exact slirp4netns startup capability contract."
   have slirp4netns || die "slirp4netns is required for a private worker network."
   slirp_help="$(LC_ALL=C slirp4netns --help 2>&1)" || die "slirp4netns help detection failed."
   [[ "$slirp_help" == *"--enable-sandbox"* && "$slirp_help" == *"--enable-seccomp"* ]] \
@@ -652,7 +692,7 @@ jit_write_worker_state() {
 }
 
 jit_execute_runner() {
-  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper main_pid=0 main_ticks="" slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file protected_path network_inaccessible_paths=""
+  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper docker_socket_guard main_pid=0 main_ticks="" slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file protected_path network_inaccessible_paths=""
   local -a network_systemd_args network_protected_paths
   jit_load_worker_identity "$state_file"
   user="$JIT_WORKER_USER"; group="$JIT_WORKER_GROUP"; worker_root="$JIT_WORKER_ROOT"; home="$JIT_WORKER_HOME"
@@ -661,7 +701,7 @@ jit_execute_runner() {
     config_file="${worker_root}/controller/.jitconfig"
     printf '%s\n' "$config" >"$config_file"
     chmod 600 "$config_file"
-    env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="$JIT_SYSTEM_PATH" XDG_RUNTIME_DIR="$(dirname "$docker_socket")" DOCKER_HOST="unix://${docker_socket}" \
+    env -i HOME="$home" USER="$user" LOGNAME="$user" PATH="$JIT_SYSTEM_PATH" XDG_RUNTIME_DIR="$(dirname "$docker_socket")" DOCKER_HOST="unix://${docker_socket}" ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER=true \
       /bin/bash --noprofile --norc -c 'set -euo pipefail; IFS= read -r ACTIONS_RUNNER_INPUT_JITCONFIG; export ACTIONS_RUNNER_INPUT_JITCONFIG; exec "$1/run.sh"' jit-worker "$runner_dir" <"$config_file" &
     runner_pid=$!; runner_boot="$(cat /proc/sys/kernel/random/boot_id)"; runner_ticks="$(jit_process_start_ticks "$runner_pid")"
     jq --arg pid "$runner_pid" --arg boot "$runner_boot" --arg ticks "$runner_ticks" --arg now "$(utc_now)" '.controller_children=[{pid:($pid|tonumber),boot_id:$boot,start_ticks:($ticks|tonumber)}] | .updated_at=$now' "$state_file" | jit_atomic_write "$state_file"
@@ -685,6 +725,9 @@ jit_execute_runner() {
   mkdir -p "$(dirname "$network_ready")"
   printf 'nameserver 10.0.2.3\n' >"${worker_root}/controller/resolv.conf"
   chown root:root "${worker_root}/controller/resolv.conf"; chmod 644 "${worker_root}/controller/resolv.conf"
+  docker_socket_guard="${worker_root}/controller/no-docker.sock"
+  : >"$docker_socket_guard"
+  chown root:root "$docker_socket_guard"; chmod 000 "$docker_socket_guard"
   rm -f "$network_ready"
 
   jit_checkpoint_worker_resource "$state_file" sandbox_unit mutation_started sandbox-unit-start-requested
@@ -695,7 +738,8 @@ jit_execute_runner() {
     --property=ProtectSystem=strict --property=ProtectHome=yes --property="ReadWritePaths=${worker_root}" --property="ReadWritePaths=${runtime_dir}" \
     --property="TemporaryFileSystem=/dev/shm:rw,nosuid,nodev,noexec,size=64M" \
     --property="BindReadOnlyPaths=${worker_root}/controller/resolv.conf:/etc/resolv.conf" \
-    --property="InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock -/run/user" \
+    --property="BindReadOnlyPaths=${docker_socket_guard}:/run/docker.sock" \
+    --property="InaccessiblePaths=-/run/user" \
     --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" \
     --property=Delegate=yes --property=KillMode=control-group --property=UMask=0077 \
     "$runtime_helper" "$home" "$runner_dir" "$runtime_dir" "$docker_socket" "$network_ready" \
@@ -732,7 +776,7 @@ jit_execute_runner() {
     --property=ProtectHome=yes --property=ProtectSystem=strict --property=ProtectControlGroups=yes
     --property=ProtectKernelTunables=yes --property=ProtectKernelModules=yes --property=ProtectKernelLogs=yes --property=ProtectClock=yes
     --property=LockPersonality=yes --property=RestrictSUIDSGID=yes
-    --property="CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN"
+    --property="CapabilityBoundingSet=${JIT_SLIRP_STARTUP_CAPABILITIES}"
     --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
     --property="StandardOutput=file:${network_ready}"
   )
@@ -744,13 +788,19 @@ jit_execute_runner() {
   jit_checkpoint_worker_resource "$state_file" network_unit mutation_started network-unit-start-requested
   systemd-run "${network_systemd_args[@]}" /bin/bash --noprofile --norc -c '
     set -Eeuo pipefail
-    target_pid="$1"; shift
+    target_pid="$1"; expected_cap_mask="$2"; shift 2
+    for key in CapPrm CapEff CapBnd; do
+      actual="$(awk -v key="${key}:" '\''$1 == key && NF == 2 { print tolower($2) }'\'' /proc/self/status)"
+      [[ "$actual" == "$expected_cap_mask" ]] || { printf "Network helper startup capability mismatch for %s.\n" "$key" >&2; exit 76; }
+    done
+    [[ "$(awk '\''$1 == "CapAmb:" && NF == 2 { print tolower($2) }'\'' /proc/self/status)" == "0000000000000000" ]] \
+      || { printf "Network helper unexpectedly received ambient capabilities.\n" >&2; exit 76; }
     for protected_path in "$@"; do
       [[ ! -r "$protected_path" ]] || { printf "Network helper can read protected host path: %s\n" "$protected_path" >&2; exit 77; }
     done
     exec /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
       slirp4netns --enable-sandbox --enable-seccomp --configure --mtu=65520 --disable-host-loopback --ready-fd 1 "$target_pid" tap0
-  ' jit-slirp "$main_pid" "${network_protected_paths[@]}"
+  ' jit-slirp "$main_pid" "$JIT_SLIRP_STARTUP_CAP_MASK" "${network_protected_paths[@]}"
   jit_checkpoint_worker_resource "$state_file" network_unit created network-unit-created
   jit_fault_inject worker-after-network-unit-created
   jit_fault_inject worker-before-network-readiness
@@ -760,6 +810,8 @@ jit_execute_runner() {
   slirp_pid="$(systemctl show --property=MainPID --value "$network_unit")"
   slirp_ticks="$(jit_process_start_ticks "$slirp_pid" 2>/dev/null || true)"
   [[ "$slirp_pid" =~ ^[1-9][0-9]*$ && "$slirp_ticks" =~ ^[1-9][0-9]*$ ]] || { systemctl stop "$network_unit" >/dev/null 2>&1 || true; systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker slirp identity could not be persisted."; }
+  jit_validate_slirp_runtime_capabilities "$slirp_pid" "$slirp_ticks" \
+    || { systemctl stop "$network_unit" >/dev/null 2>&1 || true; systemctl stop "$unit" >/dev/null 2>&1 || true; wait "$systemd_pid" || true; die "Private worker slirp retained capabilities outside its runtime contract."; }
   jit_fault_inject worker-before-slirp-identity-persisted
   jq --arg slirp_pid "$slirp_pid" --arg slirp_ticks "$slirp_ticks" --arg boot_id "$boot_id" --arg now "$(utc_now)" '
     .sandbox_slirp_pid=($slirp_pid|tonumber) | .sandbox_slirp_boot_id=$boot_id | .sandbox_slirp_start_ticks=($slirp_ticks|tonumber) |

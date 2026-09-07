@@ -2,6 +2,10 @@
 set -Eeuo pipefail
 
 : "${ACTIONS_RUNNER_INPUT_JITCONFIG:?missing JIT configuration}"
+[[ "${ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER:-}" == true ]] || {
+  printf 'The runner was not forced into job-container mode.\n' >&2
+  exit 69
+}
 unset ACTIONS_RUNNER_INPUT_JITCONFIG
 
 mkdir -p "$(dirname "$0")/_diag"

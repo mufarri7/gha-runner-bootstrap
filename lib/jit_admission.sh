@@ -349,7 +349,7 @@ jit_prepare_admission() {
     return 0
   fi
   jq -n \
-    --argjson schema_version "$JIT_SCHEMA_VERSION" --arg id "$admission_id" --arg project "$project" --arg repository "$JIT_POLICY_REPOSITORY" \
+    --argjson schema_version "$JIT_ADMISSION_SCHEMA_VERSION" --arg id "$admission_id" --arg project "$project" --arg repository "$JIT_POLICY_REPOSITORY" \
     --arg run_id "$JIT_ARG_RUN_ID" --arg run_attempt "$JIT_ARG_RUN_ATTEMPT" --arg pr_number "$JIT_ARG_PR_NUMBER" \
     --arg base_sha "$JIT_ARG_BASE_SHA" --arg head_sha "$JIT_ARG_HEAD_SHA" --arg merge_sha "$JIT_ARG_MERGE_SHA" --arg tree_sha "$JIT_ARG_TREE_SHA" --arg label "$JIT_ARG_LABEL" \
     --arg verified_at "$verified_at" --arg expires_epoch "$expires_epoch" --argjson verification "$verification" \
@@ -360,11 +360,16 @@ jit_prepare_admission() {
 }
 
 jit_load_admission() {
-  local admission_id="$1" file
+  local admission_id="$1" file workload_boundary
   [[ "$admission_id" =~ ^[0-9a-f]{64}$ ]] || die "Invalid admission ID."
   file="$(jit_admission_file "$admission_id")"
   [[ -r "$file" ]] || die "Unknown admission: $admission_id"
-  jq -e --argjson schema "$JIT_SCHEMA_VERSION" --arg id "$admission_id" '.schema_version==$schema and .id==$id and (.status|type=="string")' "$file" >/dev/null || die "Invalid admission state: $file"
+  jq -e --argjson schema "$JIT_ADMISSION_SCHEMA_VERSION" --arg id "$admission_id" '
+    .schema_version==$schema and .id==$id and (.status|type=="string") and
+    (.verification.evidence.workload_boundary|type=="object")
+  ' "$file" >/dev/null || die "Invalid admission state: $file"
+  workload_boundary="$(jq -c '.verification.evidence.workload_boundary' "$file")"
+  jit_validate_workload_boundary_json "$workload_boundary" || die "Admission workload boundary is missing or unsafe: $file"
   JIT_ADMISSION_FILE="$file"
   JIT_ADMISSION_ID="$admission_id"
   JIT_ADMISSION_PROJECT="$(jq -r .project "$file")"
@@ -493,15 +498,18 @@ jit_admission_state_blocks_new_launch() {
 }
 
 jit_validate_admission_lease_state() {
-  local admission_file="$1" expected_id
+  local admission_file="$1" expected_id workload_boundary
   expected_id="$(basename -- "$admission_file" .json)"
-  jq -e --argjson schema "$JIT_SCHEMA_VERSION" --arg expected_id "$expected_id" '
+  jq -e --argjson schema "$JIT_ADMISSION_SCHEMA_VERSION" --arg expected_id "$expected_id" '
     .schema_version==$schema and .id==$expected_id and (.id|type=="string" and test("^[0-9a-f]{64}$")) and
     (.project|type=="string" and test("^[a-z0-9][a-z0-9-]*$")) and
     (.repository|type=="string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) and
     (.label|type=="string" and test("^[a-z0-9][a-z0-9-]*$")) and
-    (.status|type=="string" and test("^(prepared|creating|registration-requested|registered|running|cancelled|cancelled-with-live-workers|cleanup-pending|completed|failed|cleaned)$"))
-  ' "$admission_file" >/dev/null 2>&1
+    (.status|type=="string" and test("^(prepared|creating|registration-requested|registered|running|cancelled|cancelled-with-live-workers|cleanup-pending|completed|failed|cleaned)$")) and
+    (.verification.evidence.workload_boundary|type=="object")
+  ' "$admission_file" >/dev/null 2>&1 || return 1
+  workload_boundary="$(jq -c '.verification.evidence.workload_boundary' "$admission_file" 2>/dev/null)" || return 1
+  jit_validate_workload_boundary_json "$workload_boundary"
 }
 
 jit_admission_has_deterministic_units() {

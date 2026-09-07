@@ -43,10 +43,12 @@ case "$MODE" in
   prepare)
     : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
     evidence_dir="$(mktemp -d "${RUNNER_TEMP}/ghrctl-live-evidence.XXXXXX")"
+    workload_boundary="$(jq -cn --arg image "ghcr.io/mufarri7/ghrctl-ci@sha256:$(printf 'a%.0s' {1..64})" \
+      '{schema_version:1,job_container_required:true,job_container_images:[$image],service_container_images:[],container_options:[],container_volumes:[]}')"
     jq -n --arg repository "$GITHUB_REPOSITORY" --arg workflow_path "$workflow_path" --arg workflow_name "$GITHUB_WORKFLOW" --arg job_name "$GITHUB_JOB" \
       --argjson workflow_id "$workflow_id" --argjson job_id "$job_id" --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" --argjson pr_number "$pr_number" \
-      --arg sha "$run_sha" --arg label "ghrctl-live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --arg generated_at "$(utc_now)" \
-      '{schema_version:1,repository:$repository,workflow_path:$workflow_path,workflow_name:$workflow_name,workflow_id:$workflow_id,run_id:$run_id,run_attempt:$run_attempt,admission_job_id:$job_id,admission_job_name:$job_name,pr_number:$pr_number,base_sha:$sha,head_sha:$sha,merge_sha:$sha,tree_sha:$sha,label:$label,generated_at:$generated_at}' \
+      --arg sha "$run_sha" --arg label "ghrctl-live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" --arg generated_at "$(utc_now)" --argjson workload_boundary "$workload_boundary" \
+      '{schema_version:2,repository:$repository,workflow_path:$workflow_path,workflow_name:$workflow_name,workflow_id:$workflow_id,run_id:$run_id,run_attempt:$run_attempt,admission_job_id:$job_id,admission_job_name:$job_name,pr_number:$pr_number,base_sha:$sha,head_sha:$sha,merge_sha:$sha,tree_sha:$sha,label:$label,generated_at:$generated_at,workload_boundary:$workload_boundary}' \
       >"${evidence_dir}/admission.json"
     {
       printf 'artifact_name=%s\n' "$artifact_name"

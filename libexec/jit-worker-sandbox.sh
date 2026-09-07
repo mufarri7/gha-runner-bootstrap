@@ -35,7 +35,7 @@ done
 [[ -s "$network_ready" ]] || { printf 'Private network setup did not become ready.\n' >&2; exit 75; }
 docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
 
-env ACTIONS_RUNNER_INPUT_JITCONFIG="$jit_config" "$runner_dir/run.sh" &
+env ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER=true ACTIONS_RUNNER_INPUT_JITCONFIG="$jit_config" "$runner_dir/run.sh" &
 runner_pid=$!
 unset jit_config
 set +e

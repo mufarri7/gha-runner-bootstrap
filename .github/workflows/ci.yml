@@ -24,7 +24,7 @@ jobs:
       - name: Python syntax
         run: python3 -m py_compile libexec/*.py
       - name: ShellCheck
-        run: shellcheck -x ghrctl libexec/*.sh tests/test.sh tests/live_artifact_test.sh tests/jit_ubuntu_24_04.sh tests/fixtures/*/run.sh
+        run: shellcheck -x ghrctl libexec/*.sh tests/test.sh tests/live_artifact_test.sh tests/jit_candidate_boundary_probe.sh tests/jit_ubuntu_24_04.sh tests/fixtures/*/run.sh
       - name: Functional tests
         run: ./tests/test.sh
       - name: Prepare live admission artifact fixture

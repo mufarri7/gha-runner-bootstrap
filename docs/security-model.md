@@ -37,6 +37,9 @@
 - root-locked host/project diagnostic quotas, free-space floor, deterministic TTL/count pruning, and failure-evidence preference;
 - cross-device/mount-ID-safe no-follow diagnostic pruning that never descends into nested mounts;
 - sandboxed/seccomp-filtered slirp services with minimal attach capabilities and inaccessible controller credentials/state;
+- exact slirp startup capability inventory plus a PID-identity-bound runtime proof that only `CAP_NET_BIND_SERVICE` remains;
+- trusted, digest-pinned, option/volume-free job-container admission with host-mode execution rejected;
+- no candidate mount of runner `.runner`, `.credentials*`, JIT configuration, supervisor processes, or the Rootless Docker control socket;
 - file- and parent-directory-fsynced critical JIT state replacement.
 
 ## Residual risks
@@ -44,6 +47,7 @@
 - Persistent runners can retain malicious changes between jobs.
 - A compromised workflow can consume CPU, RAM, disk, and network within the host user's capabilities.
 - Rootless containers still share the host kernel.
+- The trusted admission workflow must correctly derive the workload-boundary attestation; controller admission remains blocked when it is absent or ambiguous.
 - Sharing a daemon between runners of one repository means those runners share that repository's container cache and daemon trust boundary.
 - Static scanning can miss dependencies and cannot certify a workflow as safe.
 - Per-job user and Rootless Docker isolation still share the host kernel.

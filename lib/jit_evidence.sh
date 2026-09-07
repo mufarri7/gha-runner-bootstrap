@@ -35,6 +35,25 @@ jit_api_collection() {
   jq -n --arg key "$key" --argjson total "$reported_total" --argjson items "$items" '{total_count:$total} | .[$key]=$items'
 }
 
+jit_validate_workload_boundary_json() {
+  local boundary="$1"
+  jq -e --argjson schema "$JIT_WORKLOAD_BOUNDARY_SCHEMA_VERSION" '
+    def immutable_image:
+      type=="string" and length<=512 and
+      test("^[a-z0-9]+([._-][a-z0-9]+)*(?::[0-9]+)?(/[a-z0-9]+([._-][a-z0-9]+)*)*@sha256:[a-f0-9]{64}$");
+    . as $boundary |
+    (keys | sort)==(["container_options","container_volumes","job_container_images","job_container_required","schema_version","service_container_images"] | sort) and
+    .schema_version==$schema and
+    .job_container_required==true and
+    (.job_container_images|type=="array" and length>0 and length<=16 and all(.[]; immutable_image)) and
+    ((.job_container_images|length)==(.job_container_images|unique|length)) and
+    (.service_container_images|type=="array" and length<=32 and all(.[]; immutable_image)) and
+    ((.service_container_images|length)==(.service_container_images|unique|length)) and
+    .container_options==[] and
+    .container_volumes==[]
+  ' <<<"$boundary" >/dev/null 2>&1
+}
+
 jit_download_api() {
   local endpoint="$1" destination="$2" url
   jit_ensure_api_token
@@ -78,7 +97,7 @@ jit_fetch_admission_evidence() (
   set -Eeuo pipefail
   trap - ERR EXIT
   local run_json="$1" job_json="$2" run_id="$3" run_attempt="$4" pr_number="$5" base_sha="$6" head_sha="$7" merge_sha="$8" tree_sha="$9" label="${10}"
-  local workflow_id repository_id job_id expected_name artifacts artifact_count listed_artifact artifact_id artifact digest expected_digest actual_digest
+  local workflow_id repository_id job_id expected_name artifacts artifact_count listed_artifact artifact_id artifact digest expected_digest actual_digest workload_boundary
   local temporary archive evidence_file evidence artifact_created_epoch evidence_created_epoch run_created_epoch now
 
   have unzip && have zipinfo && have sha256sum || die "unzip, zipinfo, and sha256sum are required for admission evidence verification."
@@ -117,14 +136,17 @@ jit_fetch_admission_evidence() (
   [[ "${actual_digest,,}" == "${expected_digest,,}" ]] || die "Admission artifact digest mismatch."
   jit_validate_evidence_archive "$archive" "$evidence_file"
   evidence="$(cat "$evidence_file")"
-  jq -e '
-    (keys | sort)==(["admission_job_id","admission_job_name","base_sha","generated_at","head_sha","label","merge_sha","pr_number","repository","run_attempt","run_id","schema_version","tree_sha","workflow_id","workflow_name","workflow_path"] | sort) and
-    .schema_version==1 and
+  jq -e --argjson schema "$JIT_EVIDENCE_SCHEMA_VERSION" '
+    (keys | sort)==(["admission_job_id","admission_job_name","base_sha","generated_at","head_sha","label","merge_sha","pr_number","repository","run_attempt","run_id","schema_version","tree_sha","workflow_id","workflow_name","workflow_path","workload_boundary"] | sort) and
+    .schema_version==$schema and
     (.run_id|type=="number" and floor==.) and (.run_attempt|type=="number" and floor==.) and
     (.pr_number|type=="number" and floor==.) and (.workflow_id|type=="number" and floor==.) and
     (.admission_job_id|type=="number" and floor==.) and
     ([.repository,.workflow_path,.workflow_name,.admission_job_name,.base_sha,.head_sha,.merge_sha,.tree_sha,.label,.generated_at] | all(type=="string" and length>0))
   ' <<<"$evidence" >/dev/null || die "Admission evidence schema is invalid or contains unexpected fields."
+  workload_boundary="$(jq -c '.workload_boundary' <<<"$evidence")"
+  jit_validate_workload_boundary_json "$workload_boundary" \
+    || die "Admission evidence does not attest the required container-only workload boundary."
   jq -e --arg repository "$JIT_POLICY_REPOSITORY" --arg workflow_path "$JIT_POLICY_WORKFLOW_PATH" --arg workflow_name "$JIT_POLICY_WORKFLOW_NAME" --arg job_name "$JIT_POLICY_ADMISSION_JOB" \
     --argjson workflow_id "$workflow_id" --argjson job_id "$job_id" --argjson run_id "$run_id" --argjson run_attempt "$run_attempt" --argjson pr_number "$pr_number" \
     --arg base "$base_sha" --arg head "$head_sha" --arg merge "$merge_sha" --arg tree "$tree_sha" --arg label "$label" '
@@ -142,6 +164,6 @@ jit_fetch_admission_evidence() (
   (( evidence_created_epoch >= run_created_epoch && evidence_created_epoch <= artifact_created_epoch + 300 && evidence_created_epoch <= now + 300 )) \
     || die "Admission evidence timestamp is outside the trusted run-attempt window."
 
-  jq -n --argjson artifact_id "$artifact_id" --arg artifact_name "$expected_name" --arg artifact_digest "$digest" --arg artifact_created_at "$(jq -r .created_at <<<"$artifact")" \
-    '{artifact_id:$artifact_id,artifact_name:$artifact_name,artifact_digest:$artifact_digest,artifact_created_at:$artifact_created_at}'
+  jq -n --argjson artifact_id "$artifact_id" --arg artifact_name "$expected_name" --arg artifact_digest "$digest" --arg artifact_created_at "$(jq -r .created_at <<<"$artifact")" --argjson workload_boundary "$workload_boundary" \
+    '{artifact_id:$artifact_id,artifact_name:$artifact_name,artifact_digest:$artifact_digest,artifact_created_at:$artifact_created_at,workload_boundary:$workload_boundary}'
 )

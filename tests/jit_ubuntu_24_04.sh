@@ -145,8 +145,15 @@ network_unit_one="$(jq -r .sandbox_network_unit "$state_one")"
 [[ "$(systemctl show --property=NoNewPrivileges --value "$network_unit_one")" == yes ]]
 [[ "$(systemctl show --property=ProtectHome --value "$network_unit_one")" == yes ]]
 [[ "$(systemctl show --property=ProtectSystem --value "$network_unit_one")" == strict ]]
-systemctl show --property=CapabilityBoundingSet --value "$network_unit_one" | grep -qw CAP_SYS_ADMIN
-systemctl show --property=CapabilityBoundingSet --value "$network_unit_one" | grep -qw CAP_NET_ADMIN
+expected_slirp_capabilities="$(tr ' ' '\n' <<<"$JIT_SLIRP_STARTUP_CAPABILITIES" | sort)"
+actual_slirp_capabilities="$(systemctl show --property=CapabilityBoundingSet --value "$network_unit_one" | tr ' ' '\n' | tr '[:lower:]' '[:upper:]' | sort)"
+[[ "$actual_slirp_capabilities" == "$expected_slirp_capabilities" ]] || { printf 'Network helper startup capabilities differ from the reviewed contract.\n' >&2; exit 1; }
+jit_validate_slirp_runtime_capabilities "$slirp_one" "$(jq -r .sandbox_slirp_start_ticks "$state_one")" \
+  || { printf 'Worker one slirp helper retained startup-only capabilities.\n' >&2; exit 1; }
+jit_validate_slirp_runtime_capabilities "$slirp_two" "$(jq -r .sandbox_slirp_start_ticks "$state_two")" \
+  || { printf 'Worker two slirp helper retained startup-only capabilities.\n' >&2; exit 1; }
+nsenter --target "$main_one" --mount -- test -e /var/run/docker.sock
+nsenter --target "$main_one" --mount -- test ! -S /var/run/docker.sock
 nsenter --target "$main_one" --net -- curl --fail --silent --max-time 15 https://api.github.com/zen >/dev/null
 for namespace in net mnt ipc; do
   [[ "$(readlink "/proc/${main_one}/ns/${namespace}")" != "$(readlink "/proc/${main_two}/ns/${namespace}")" ]] || { printf 'Workers share %s namespace.\n' "$namespace" >&2; exit 1; }

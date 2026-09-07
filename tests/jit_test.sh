@@ -19,6 +19,14 @@ JIT_TEST_TREE=4444444444444444444444444444444444444444
 JIT_TEST_LABEL="mazaya-admission-${JIT_TEST_RUN_ID}-${JIT_TEST_ATTEMPT}"
 JIT_TEST_CASE=valid
 JIT_TEST_CREATED="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+JIT_TEST_BOUNDARY="$(jq -cn --arg image "ghcr.io/mufarri7/mazaya-ci@sha256:$(printf 'a%.0s' {1..64})" \
+  '{schema_version:1,job_container_required:true,job_container_images:[$image],service_container_images:[],container_options:[],container_volumes:[]}')"
+
+jit_validate_workload_boundary_json "$JIT_TEST_BOUNDARY" || fail "valid workload-boundary attestation was rejected"
+if jit_validate_workload_boundary_json "$(jq '.job_container_required=false' <<<"$JIT_TEST_BOUNDARY")"; then fail "host-mode workload attestation was accepted"; fi
+if jit_validate_workload_boundary_json "$(jq '.job_container_images=["ghcr.io/mufarri7/mazaya-ci:latest"]' <<<"$JIT_TEST_BOUNDARY")"; then fail "mutable workload image was accepted"; fi
+if jit_validate_workload_boundary_json "$(jq '.container_options=["--pid=host"]' <<<"$JIT_TEST_BOUNDARY")"; then fail "custom container options were accepted"; fi
+if jit_validate_workload_boundary_json "$(jq '.container_volumes=["/run/ghrctl-jit:/runtime"]' <<<"$JIT_TEST_BOUNDARY")"; then fail "custom container volumes were accepted"; fi
 
 TEST_POLICY="$TMP/jit-policy.json"
 jq -e '.project=="mazaya-backend" and .persistent_project=="mazaya-backend" and (.forbidden_online_labels | index("mazaya-backend-ci"))!=null' "$ROOT/examples/jit-policy.mazaya.json" >/dev/null \
@@ -49,20 +57,46 @@ jit_load_policy mazaya-test
   fi
 )
 
+SLIRP_CAPABILITY_INVENTORY=$'NAME NUMBER\ncap_setpcap 8\ncap_net_bind_service 10\ncap_net_admin 12\ncap_sys_ptrace 19\ncap_sys_admin 21'
+jit_validate_slirp_startup_capability_inventory "$SLIRP_CAPABILITY_INVENTORY" 40 \
+  || fail "exact slirp startup capability inventory was rejected"
+if jit_validate_slirp_startup_capability_inventory "${SLIRP_CAPABILITY_INVENTORY%$'\ncap_sys_admin 21'}" 40; then
+  fail "incomplete slirp startup capability inventory was accepted"
+fi
+if jit_validate_slirp_startup_capability_inventory "${SLIRP_CAPABILITY_INVENTORY}"$'\ncap_sys_chroot 18' 40; then
+  fail "overprivileged slirp startup capability inventory was accepted"
+fi
+SLIRP_SAFE_STATUS="$TMP/slirp-safe.status"
+SLIRP_UNSAFE_STATUS="$TMP/slirp-unsafe.status"
+{
+  printf 'CapInh:\t%s\n' "$JIT_SLIRP_RUNTIME_CAP_MASK"
+  printf 'CapPrm:\t%s\n' "$JIT_SLIRP_RUNTIME_CAP_MASK"
+  printf 'CapEff:\t%s\n' "$JIT_SLIRP_RUNTIME_CAP_MASK"
+  printf 'CapBnd:\t%s\n' "$JIT_SLIRP_RUNTIME_CAP_MASK"
+  printf 'CapAmb:\t%s\n' "$JIT_EMPTY_CAP_MASK"
+} >"$SLIRP_SAFE_STATUS"
+jit_validate_slirp_capability_status "$SLIRP_SAFE_STATUS" || fail "minimal slirp runtime capabilities were rejected"
+sed "s/^CapEff:.*/CapEff:\t${JIT_SLIRP_STARTUP_CAP_MASK}/" "$SLIRP_SAFE_STATUS" >"$SLIRP_UNSAFE_STATUS"
+if jit_validate_slirp_capability_status "$SLIRP_UNSAFE_STATUS"; then fail "slirp runtime retained startup capabilities"; fi
+
 JIT_TEST_EVIDENCE_DIR="$TMP/evidence"
 JIT_TEST_EVIDENCE_ARCHIVE="$TMP/evidence.zip"
 JIT_TEST_BAD_EVIDENCE_ARCHIVE="$TMP/evidence-bad.zip"
+JIT_TEST_UNSAFE_BOUNDARY_DIR="$TMP/evidence-unsafe-boundary"
+JIT_TEST_UNSAFE_BOUNDARY_ARCHIVE="$TMP/evidence-unsafe-boundary.zip"
 JIT_TEST_UNSAFE_EVIDENCE_DIR="$TMP/evidence-unsafe"
 JIT_TEST_UNSAFE_EVIDENCE_ARCHIVE="$TMP/evidence-unsafe.zip"
 JIT_TEST_OVERSIZED_EVIDENCE_DIR="$TMP/evidence-oversized"
 JIT_TEST_OVERSIZED_EVIDENCE_ARCHIVE="$TMP/evidence-oversized.zip"
-mkdir -p "$JIT_TEST_EVIDENCE_DIR"
+mkdir -p "$JIT_TEST_EVIDENCE_DIR" "$JIT_TEST_UNSAFE_BOUNDARY_DIR"
 jq -n --arg repository "$JIT_POLICY_REPOSITORY" --arg workflow_path "$JIT_POLICY_WORKFLOW_PATH" --arg workflow_name "$JIT_POLICY_WORKFLOW_NAME" --arg job_name "$JIT_POLICY_ADMISSION_JOB" \
   --argjson workflow_id 7654 --argjson job_id 9001 --argjson run_id "$JIT_TEST_RUN_ID" --argjson run_attempt "$JIT_TEST_ATTEMPT" --argjson pr_number "$JIT_TEST_PR" \
-  --arg base "$JIT_TEST_BASE" --arg head "$JIT_TEST_HEAD" --arg merge "$JIT_TEST_MERGE" --arg tree "$JIT_TEST_TREE" --arg label "$JIT_TEST_LABEL" --arg generated_at "$JIT_TEST_CREATED" \
-  '{schema_version:1,repository:$repository,workflow_path:$workflow_path,workflow_name:$workflow_name,workflow_id:$workflow_id,run_id:$run_id,run_attempt:$run_attempt,admission_job_id:$job_id,admission_job_name:$job_name,pr_number:$pr_number,base_sha:$base,head_sha:$head,merge_sha:$merge,tree_sha:$tree,label:$label,generated_at:$generated_at}' \
+  --arg base "$JIT_TEST_BASE" --arg head "$JIT_TEST_HEAD" --arg merge "$JIT_TEST_MERGE" --arg tree "$JIT_TEST_TREE" --arg label "$JIT_TEST_LABEL" --arg generated_at "$JIT_TEST_CREATED" --argjson workload_boundary "$JIT_TEST_BOUNDARY" \
+  '{schema_version:2,repository:$repository,workflow_path:$workflow_path,workflow_name:$workflow_name,workflow_id:$workflow_id,run_id:$run_id,run_attempt:$run_attempt,admission_job_id:$job_id,admission_job_name:$job_name,pr_number:$pr_number,base_sha:$base,head_sha:$head,merge_sha:$merge,tree_sha:$tree,label:$label,generated_at:$generated_at,workload_boundary:$workload_boundary}' \
   >"$JIT_TEST_EVIDENCE_DIR/admission.json"
 (cd "$JIT_TEST_EVIDENCE_DIR" && python3 -m zipfile -c "$JIT_TEST_EVIDENCE_ARCHIVE" admission.json)
+jq '.workload_boundary.job_container_required=false' "$JIT_TEST_EVIDENCE_DIR/admission.json" >"$JIT_TEST_UNSAFE_BOUNDARY_DIR/admission.json"
+(cd "$JIT_TEST_UNSAFE_BOUNDARY_DIR" && python3 -m zipfile -c "$JIT_TEST_UNSAFE_BOUNDARY_ARCHIVE" admission.json)
 jq '.head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$JIT_TEST_EVIDENCE_DIR/admission.json" >"$JIT_TEST_EVIDENCE_DIR/admission-bad.json"
 mv "$JIT_TEST_EVIDENCE_DIR/admission-bad.json" "$JIT_TEST_EVIDENCE_DIR/admission.json"
 (cd "$JIT_TEST_EVIDENCE_DIR" && python3 -m zipfile -c "$JIT_TEST_BAD_EVIDENCE_ARCHIVE" admission.json)
@@ -76,6 +110,7 @@ dd if=/dev/zero of="$JIT_TEST_OVERSIZED_EVIDENCE_DIR/admission.json" bs=17000 co
 (cd "$JIT_TEST_OVERSIZED_EVIDENCE_DIR" && python3 -m zipfile -c "$JIT_TEST_OVERSIZED_EVIDENCE_ARCHIVE" admission.json)
 JIT_TEST_EVIDENCE_DIGEST="sha256:$(sha256sum "$JIT_TEST_EVIDENCE_ARCHIVE" | awk '{print $1}')"
 JIT_TEST_BAD_EVIDENCE_DIGEST="sha256:$(sha256sum "$JIT_TEST_BAD_EVIDENCE_ARCHIVE" | awk '{print $1}')"
+JIT_TEST_UNSAFE_BOUNDARY_DIGEST="sha256:$(sha256sum "$JIT_TEST_UNSAFE_BOUNDARY_ARCHIVE" | awk '{print $1}')"
 JIT_TEST_UNSAFE_EVIDENCE_DIGEST="sha256:$(sha256sum "$JIT_TEST_UNSAFE_EVIDENCE_ARCHIVE" | awk '{print $1}')"
 JIT_TEST_OVERSIZED_EVIDENCE_DIGEST="sha256:$(sha256sum "$JIT_TEST_OVERSIZED_EVIDENCE_ARCHIVE" | awk '{print $1}')"
 
@@ -83,6 +118,7 @@ jit_download_api() {
   local _endpoint="$1" destination="$2"
   case "$JIT_TEST_CASE" in
     evidence-mismatch) cp "$JIT_TEST_BAD_EVIDENCE_ARCHIVE" "$destination" ;;
+    unsafe-workload-boundary) cp "$JIT_TEST_UNSAFE_BOUNDARY_ARCHIVE" "$destination" ;;
     unsafe-evidence) cp "$JIT_TEST_UNSAFE_EVIDENCE_ARCHIVE" "$destination" ;;
     oversized-evidence) cp "$JIT_TEST_OVERSIZED_EVIDENCE_ARCHIVE" "$destination" ;;
     *) cp "$JIT_TEST_EVIDENCE_ARCHIVE" "$destination" ;;
@@ -105,6 +141,7 @@ jit_api() {
   artifact_name="${JIT_POLICY_EVIDENCE_ARTIFACT_PREFIX}${JIT_TEST_RUN_ID}-${JIT_TEST_ATTEMPT}-9001"
   artifact_archive="$JIT_TEST_EVIDENCE_ARCHIVE"; artifact_digest="$JIT_TEST_EVIDENCE_DIGEST"
   if [[ "$JIT_TEST_CASE" == evidence-mismatch ]]; then artifact_archive="$JIT_TEST_BAD_EVIDENCE_ARCHIVE"; artifact_digest="$JIT_TEST_BAD_EVIDENCE_DIGEST"; fi
+  if [[ "$JIT_TEST_CASE" == unsafe-workload-boundary ]]; then artifact_archive="$JIT_TEST_UNSAFE_BOUNDARY_ARCHIVE"; artifact_digest="$JIT_TEST_UNSAFE_BOUNDARY_DIGEST"; fi
   if [[ "$JIT_TEST_CASE" == unsafe-evidence ]]; then artifact_archive="$JIT_TEST_UNSAFE_EVIDENCE_ARCHIVE"; artifact_digest="$JIT_TEST_UNSAFE_EVIDENCE_DIGEST"; fi
   if [[ "$JIT_TEST_CASE" == oversized-evidence ]]; then artifact_archive="$JIT_TEST_OVERSIZED_EVIDENCE_ARCHIVE"; artifact_digest="$JIT_TEST_OVERSIZED_EVIDENCE_DIGEST"; fi
   [[ "$JIT_TEST_CASE" != artifact-digest-mismatch ]] || artifact_digest="sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -252,14 +289,14 @@ jit_api() {
 
 JIT_TEST_CASE=valid
 verification="$(jit_verify_admission "$JIT_TEST_RUN_ID" "$JIT_TEST_ATTEMPT" "$JIT_TEST_PR" "$JIT_TEST_BASE" "$JIT_TEST_HEAD" "$JIT_TEST_MERGE" "$JIT_TEST_TREE" "$JIT_TEST_LABEL")"
-jq -e '.workflow_id==7654 and .admission_job_id==9001 and .evidence.artifact_id==6001' >/dev/null <<<"$verification" || fail "valid artifact-backed admission verification failed"
+jq -e '.workflow_id==7654 and .admission_job_id==9001 and .evidence.artifact_id==6001 and .evidence.workload_boundary.job_container_required==true' >/dev/null <<<"$verification" || fail "valid artifact-backed admission verification failed"
 
 for JIT_TEST_CASE in admission-page-2 evidence-page-2; do
   jit_verify_admission "$JIT_TEST_RUN_ID" "$JIT_TEST_ATTEMPT" "$JIT_TEST_PR" "$JIT_TEST_BASE" "$JIT_TEST_HEAD" "$JIT_TEST_MERGE" "$JIT_TEST_TREE" "$JIT_TEST_LABEL" >/dev/null \
     || fail "paginated trusted admission evidence failed: $JIT_TEST_CASE"
 done
 
-for JIT_TEST_CASE in wrong-repository wrong-event wrong-attempt wrong-workflow wrong-actor skipped-admission failed-admission stale evidence-mismatch unsafe-evidence oversized-evidence artifact-digest-mismatch missing-evidence; do
+for JIT_TEST_CASE in wrong-repository wrong-event wrong-attempt wrong-workflow wrong-actor skipped-admission failed-admission stale evidence-mismatch unsafe-workload-boundary unsafe-evidence oversized-evidence artifact-digest-mismatch missing-evidence; do
   if (jit_verify_admission "$JIT_TEST_RUN_ID" "$JIT_TEST_ATTEMPT" "$JIT_TEST_PR" "$JIT_TEST_BASE" "$JIT_TEST_HEAD" "$JIT_TEST_MERGE" "$JIT_TEST_TREE" "$JIT_TEST_LABEL" >/dev/null 2>&1); then
     fail "unsafe admission case was accepted: $JIT_TEST_CASE"
   fi
@@ -280,6 +317,13 @@ fi
 
 JIT_ADMISSION_ID="$(find "$JIT_ADMISSIONS_DIR" -maxdepth 1 -type f -name '*.json' -printf '%f\n' | sed 's/\.json$//' | head -n1)"
 jit_load_admission "$JIT_ADMISSION_ID"
+admission_file="$(jit_admission_file "$JIT_ADMISSION_ID")"
+assert_eq "$(jq -r .schema_version "$admission_file")" "$JIT_ADMISSION_SCHEMA_VERSION" "new admissions should persist the workload-boundary schema"
+jq -e '.verification.evidence.workload_boundary.job_container_required==true' "$admission_file" >/dev/null \
+  || fail "admission did not persist the verified workload-boundary attestation"
+legacy_admission="$TMP/${JIT_ADMISSION_ID}.json"
+jq --argjson schema "$JIT_SCHEMA_VERSION" '.schema_version=$schema' "$admission_file" >"$legacy_admission"
+if jit_validate_admission_lease_state "$legacy_admission"; then fail "legacy admission schema failed open"; fi
 
 # Staging uses explicit output parameters so controller state is not lost when
 # the helper is invoked from a subshell or a command substitution.
