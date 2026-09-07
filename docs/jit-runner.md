@@ -21,6 +21,15 @@ Candidate workflow code never calls the runner-management API. `ghrctl` requests
 
 The controller sends only the exact policy-derived label to `generate-jitconfig`. It rejects a response containing `self-hosted`, OS/architecture, `shared-ci`, repository-wide, or any second label. GitHub documents JIT runners as one-job runners and warns that hardware reuse still requires a clean environment; this implementation therefore destroys the entire mutable worker boundary rather than deleting only `.runner`.
 
+The Actions Runner listener is an explicit component of the JIT trusted
+computing base (TCB). JIT mode is pinned to reviewed version `2.337.0`; it does
+not follow the `latest` release. The controller resolves only the exact tagged
+asset and requires its GitHub-published SHA-256 to equal the source-pinned
+digest for the current architecture. Version, architecture, asset name, and
+digest are bound into the root-owned runtime manifest, admission journal, and
+every worker journal. A cache marker or binary-version mismatch is never
+accepted as the selected runner.
+
 ## Policy
 
 Start from [`examples/jit-policy.mazaya.json`](../examples/jit-policy.mazaya.json). Important fields are:
@@ -56,6 +65,16 @@ The controller supports three trusted-only modes:
 The identity needs Actions read, Contents read, Pull requests read, and repository Administration write. GitHub App installation tokens are refreshed before expiry. Authorization headers are supplied to `curl` through standard input rather than command arguments. Tokens, JWTs, private keys, and encoded JIT configurations are never written to policy, admission, migration, worker, log, backup, home, or runner state.
 
 The encoded configuration enters the new runner through the upstream `ACTIONS_RUNNER_INPUT_JITCONFIG` input. The runner removes `ACTIONS_RUNNER_INPUT_*` variables during command parsing before it creates a job worker. `ghrctl` additionally launches with `env -i`, a fixed system-only PATH, and no controller environment inheritance. `ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER=true` is mandatory: a job without a job container is rejected before candidate steps can execute alongside the same-UID runner supervisor.
+
+Before the listener starts, a provenance-bound validator reads the encoded JIT
+configuration only from standard input, decodes the expected in-memory
+`.runner`, `.credentials`, and `.credentials_rsaparams` envelope, and requires
+the JSON boolean `DisableUpdate` to be exactly `true`. Missing, false, malformed,
+truncated, wrong-type, or unexpected-schema data fails closed after the remote
+runner ID is journaled for cleanup. The validator emits no decoded data and no
+credential or encoded configuration is added to arguments, environment,
+journals, or diagnostics. The sandbox records only the non-secret listener
+version before and after the job and fails if it changes.
 
 ## Admission and lifecycle
 
@@ -228,6 +247,31 @@ sudo ./ghrctl jit rollback mazaya-backend
 ```
 
 Rollback intentionally does **not** restart persistent broad-label services. After separate owner review, `ghrctl resume-project <persistent-project>` is a distinct explicit action.
+
+## Controlled JIT runner upgrade
+
+Runner upgrades are reviewed source changes, not host-side self-updates:
+
+1. Review the exact upstream tag, release notes, and listener source, including
+   the JIT configuration and `DisableUpdate` behavior. Schedule completion
+   within GitHub's 30-day freshness window for runners with self-update disabled.
+2. Record the official SHA-256 for every supported Linux architecture and
+   update the pinned version and digest constants together.
+3. Update the fake version fixtures and provenance regressions; prove the old
+   version/digest and any mixed selection fail closed.
+4. Run static and fake lifecycle tests, then the guarded Ubuntu test on a new
+   disposable host. Run the private live canary and preserve the listener
+   version before and after every job plus absence of runner update artifacts.
+5. Submit the upgrade for owner review. Never mutate a running cache, rely on
+   `latest`, or enable the upstream self-update path.
+
+Before installing an upgraded controller, clean every non-terminal admission
+with the previous controller. The cleanup path intentionally recognizes a
+legacy worker that has no runner-provenance fields only to tear down its
+already-journaled deterministic resources; such a record can never be resumed
+or launched. Once cleanup makes it terminal, admission scanning accepts the
+legacy record as historical evidence while all new workers require exact
+runner provenance.
 
 ## Residual risk
 

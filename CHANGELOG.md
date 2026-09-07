@@ -22,6 +22,7 @@ The project follows semantic versioning after `1.0.0`. Pre-1.0 beta versions may
 - Exact deterministic production runtime IDs and a versioned, fail-closed resource-checkpoint schema across MainPID/network/slirp setup.
 - Cross-device, mount-inventory, and descriptor-safe diagnostics pruning plus sandboxed/seccomp-filtered network helpers.
 - Exact slirp startup/runtime capability contracts and trusted container-only admission that withholds runner credentials, supervisor processes, and Docker control sockets from candidate code.
+- Explicit Actions Runner `2.337.0` JIT TCB pinning, official digest/provenance enforcement, and secret-free fail-closed `DisableUpdate=true` validation.
 - Corrected `mazaya-backend` policy with case-insensitive project-derived reusable-label quarantine.
 - Fake lifecycle/security tests plus a guarded Ubuntu 24.04 destructive test and pre-stable validation plan.
 

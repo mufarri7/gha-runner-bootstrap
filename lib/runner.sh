@@ -11,6 +11,21 @@ latest_runner_release() {
   printf '%s\t%s\t%s\t%s\n' "$version" "$asset" "$url" "$digest"
 }
 
+runner_release_by_version() {
+  local version="$1" arch="$2" json asset count url digest
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid pinned runner release version."
+  json="$(curl -fsSL --retry 3 "https://api.github.com/repos/actions/runner/releases/tags/v${version}")" \
+    || die "Unable to query the pinned GitHub Actions runner release."
+  jq -e --arg tag "v${version}" '.tag_name==$tag and .draft==false and .prerelease==false' <<<"$json" >/dev/null \
+    || die "Pinned runner release metadata does not match the reviewed tag."
+  asset="actions-runner-linux-${arch}-${version}.tar.gz"
+  count="$(jq --arg asset "$asset" '[.assets[] | select(.name==$asset)] | length' <<<"$json")"
+  [[ "$count" == 1 ]] || die "Pinned runner release must contain exactly one expected asset."
+  url="$(jq -r --arg asset "$asset" '.assets[] | select(.name==$asset) | .browser_download_url' <<<"$json")"
+  digest="$(jq -r --arg asset "$asset" '.assets[] | select(.name==$asset) | (.digest // "")' <<<"$json")"
+  printf '%s\t%s\t%s\t%s\n' "$version" "$asset" "$url" "$digest"
+}
+
 get_api_auth_mode() {
   local mode="$1" repo_full="$2" endpoint="$3" token response
   case "$mode" in

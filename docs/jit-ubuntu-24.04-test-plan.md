@@ -8,7 +8,7 @@ This plan is mandatory before a stable release. It is intentionally not run on a
 2. Confirm the VM has no production credentials, workloads, runner registrations, or rootful Docker daemon/socket.
 3. Review the exact branch/commit under test.
 4. Create `/etc/ghrctl/ALLOW_DESTRUCTIVE_JIT_TEST` as root, mode `0600`, containing the exact `/etc/machine-id`. This one-host handshake is required by `tests/jit_ubuntu_24_04.sh`.
-5. Run Bash syntax, ShellCheck, and `tests/test.sh` before the destructive test.
+5. Run Bash syntax, ShellCheck, and `tests/test.sh` before the destructive test. Confirm the exact reviewed Actions Runner tag and official architecture digest match the source-pinned JIT TCB contract.
 
 ## Boundary destruction test
 
@@ -27,7 +27,7 @@ Run this test with the repository checkout physically under `/home` or `/root`. 
 3. Install a canary JIT policy with `max_slots: 2`; use a minimum-permission GitHub App installation.
 4. Verify the two initial jobs receive different users, homes, runner installations, process identities, Rootless Docker sockets, Docker data roots, and workspaces.
 5. Create a host-only `/root/ghrctl-host-boundary-sentinel`, then run `tests/jit_candidate_boundary_probe.sh` inside every job container. Preserve its output and prove candidate code cannot read `.runner`, `.credentials*`, JIT configuration, controller/root state, supervisor processes, or a Docker control socket. Write unique file, process, environment, image, container, and volume markers in each job; prove neither slot can read the other.
-6. Verify each runner accepts only one job, exits, is deregistered, and has its mutable boundary destroyed.
+6. Verify each runner reports listener version `2.337.0` before and after its only job, accepts only one job, creates no `_update` payload or self-update process, exits, is deregistered, and has its mutable boundary destroyed. Preserve the admission and worker version/asset/digest provenance and prove a changed version or digest fails closed.
 7. Verify a replacement worker is created for the third queued job and is unable to observe markers from either prior job.
 8. Repeat with job success, failure, cancellation, controller `SIGTERM`, and a VM restart during a job. Run `jit resume` after restart and verify stale cleanup precedes any replacement.
 9. Verify runner and bounded controller diagnostics remain in root-owned external storage after every worker directory is gone and contain no credential/JIT configuration. Exercise top-level/nested symlinks and rename races to `/root` and `/etc`, FIFO/socket/device/hardlink/sparse inputs, file-count/per-file/aggregate caps, project/host quotas, retention count/TTL, minimum-free-space exhaustion, and deterministic root-locked pruning. Mount a tmpfs and a same-device bind mount below a retained worker, force pruning, and prove both sentinels survive while pruning fails closed; every unsafe collection must fail closed without partial retention and failure evidence must be preferred.
@@ -35,6 +35,7 @@ Run this test with the repository checkout physically under `/home` or `/root`. 
 11. Attempt stale run, replay, wrong repository/workflow/attempt/actor/SHA/label, failed/skipped admission, default labels, active broad-label persistent runner, rootful Docker socket, writable PATH, replacement exhaustion, and cleanup mount failures. Every case must fail closed.
 12. Inject a failure after every boundary/group/user/subid/runner-copy/sandbox/Docker mutation and at every registration-intent/remote-create/ID-persistence boundary, then prove deterministic cleanup and exact remote reconciliation from the persisted worker journal.
 13. Abruptly restart the disposable VM immediately before and after durable worker and migration checkpoints. Credit recovery only after the file fsync, atomic rename, and parent-directory fsync completed; verify no replacement starts before stale cleanup and registration reconciliation.
+14. Exercise real `generate-jitconfig` responses without printing or saving the payload. Prove the decoded `.runner` has JSON boolean `DisableUpdate=true`; missing, false, malformed, truncated, and wrong-type variants must fail closed and the resulting remote runner registration must be reconciled without credential material in state, logs, diagnostics, or process arguments.
 
 ## Migration and rollback rehearsal
 

@@ -48,13 +48,19 @@ case "$GHRCTL_ROOT" in
   /home/*|/root/*) ;;
   *) printf 'This regression must execute the production backend from /home or /root.\n' >&2; exit 1 ;;
 esac
+JIT_RUNNER_SELECTED_VERSION="$JIT_PINNED_RUNNER_VERSION"
+JIT_RUNNER_SELECTED_ARCH="$(arch_name)"
+JIT_RUNNER_SELECTED_ASSET="actions-runner-linux-${JIT_RUNNER_SELECTED_ARCH}-${JIT_RUNNER_SELECTED_VERSION}.tar.gz"
+JIT_RUNNER_SELECTED_DIGEST="sha256:$(jit_pinned_runner_digest "$JIT_RUNNER_SELECTED_ARCH")"
+JIT_RUNNER_SEED="$ROOT/tests/fixtures/holding-actions-runner"
 staged_runtime_helper=""; staged_runtime_manifest=""
 jit_stage_runtime_helper staged_runtime_helper staged_runtime_manifest
 [[ "$staged_runtime_helper" != "$GHRCTL_ROOT"/* && "$staged_runtime_helper" == "$JIT_RUNTIME_DIR"/* ]] || { printf 'JIT did not use the root-owned staged runtime path.\n' >&2; exit 1; }
 [[ "$(stat -c '%u:%a' "$staged_runtime_helper")" == 0:* ]] || { printf 'Staged JIT helper is not root-owned.\n' >&2; exit 1; }
 jq -e --arg revision "$(jit_runtime_controller_revision)" --arg helper "$staged_runtime_helper" \
   --arg helper_sha256 "$(sha256sum "$staged_runtime_helper" | awk '{print $1}')" \
-  '.schema_version == 1 and (.controller_manifest.files|length)==7 and .controller_revision == $revision and .helper == $helper and .helper_sha256 == $helper_sha256' \
+  --arg runner_version "$JIT_RUNNER_SELECTED_VERSION" --arg runner_digest "$JIT_RUNNER_SELECTED_DIGEST" \
+  '.schema_version == 2 and (.controller_manifest.files|length)==8 and .controller_revision == $revision and .helper == $helper and .helper_sha256 == $helper_sha256 and .runner_version==$runner_version and .runner_asset_digest==$runner_digest' \
   "$staged_runtime_manifest" >/dev/null || { printf 'JIT runtime manifest is not bound to the staged helper.\n' >&2; exit 1; }
 JIT_ADMISSION_RUNTIME_HELPER="$staged_runtime_helper"
 JIT_ADMISSION_RUNTIME_MANIFEST="$staged_runtime_manifest"
@@ -63,12 +69,15 @@ JIT_ADMISSION_RUNTIME_CONTROLLER_REVISION="$(jit_runtime_controller_revision)"
 JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST="$(jit_runtime_controller_digest)"
 JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST="$(jq -c '.controller_manifest' "$staged_runtime_manifest")"
 JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256="$(jq -r '.controller_manifest_sha256' "$staged_runtime_manifest")"
+JIT_ADMISSION_RUNTIME_RUNNER_VERSION="$JIT_RUNNER_SELECTED_VERSION"
+JIT_ADMISSION_RUNTIME_RUNNER_ARCH="$JIT_RUNNER_SELECTED_ARCH"
+JIT_ADMISSION_RUNTIME_RUNNER_ASSET="$JIT_RUNNER_SELECTED_ASSET"
+JIT_ADMISSION_RUNTIME_RUNNER_DIGEST="$JIT_RUNNER_SELECTED_DIGEST"
 JIT_POLICY_REAL_ID_START=50000
 JIT_POLICY_REAL_ID_END=59999
 JIT_POLICY_SUBID_START=1000000000
 JIT_POLICY_SUBID_END=1067108863
 JIT_POLICY_SUBID_COUNT=65536
-JIT_RUNNER_SEED="$ROOT/tests/fixtures/holding-actions-runner"
 JIT_ADMISSION_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 mkdir -p "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
 
@@ -134,6 +143,12 @@ for _attempt in $(seq 1 300); do
   sleep 0.1
 done
 [[ "$main_one" =~ ^[1-9][0-9]*$ && "$main_two" =~ ^[1-9][0-9]*$ ]] || { printf 'Worker sandbox namespaces did not start.\n' >&2; exit 1; }
+for _attempt in $(seq 1 100); do
+  grep -q "JIT runner version before job: ${JIT_PINNED_RUNNER_VERSION}" "${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/worker-001/controller.log" 2>/dev/null && break
+  sleep 0.1
+done
+grep -q "JIT runner version before job: ${JIT_PINNED_RUNNER_VERSION}" "${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/worker-001/controller.log" \
+  || { printf 'Sandbox did not report the reviewed runner version before execution.\n' >&2; exit 1; }
 for _attempt in $(seq 1 300); do
   slirp_one="$(jq -r '.sandbox_slirp_pid // 0' "$state_one")"; slirp_two="$(jq -r '.sandbox_slirp_pid // 0' "$state_two")"
   [[ "$slirp_one" =~ ^[1-9][0-9]*$ && "$slirp_two" =~ ^[1-9][0-9]*$ ]] && break

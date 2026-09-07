@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 : "${ACTIONS_RUNNER_INPUT_JITCONFIG:?missing JIT configuration}"
+[[ "$("$(dirname "$0")/bin/Runner.Listener" --version)" == 2.337.0 ]] || exit 78
 [[ "${ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER:-}" == true ]] || {
   printf 'The runner was not forced into job-container mode.\n' >&2
   exit 69

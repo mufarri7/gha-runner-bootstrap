@@ -19,6 +19,31 @@ JIT_TEST_TREE=4444444444444444444444444444444444444444
 JIT_TEST_LABEL="mazaya-admission-${JIT_TEST_RUN_ID}-${JIT_TEST_ATTEMPT}"
 JIT_TEST_CASE=valid
 JIT_TEST_CREATED="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+JIT_TEST_JIT_SECRET='jit-secret-material-123456'
+
+jit_test_encoded_config() {
+  local mode="${1:-valid}" runner_json runner_encoded credentials_encoded rsa_encoded
+  case "$mode" in
+    valid) runner_json='{"DisableUpdate":true,"AgentName":"fixture"}' ;;
+    missing) runner_json='{"AgentName":"fixture"}' ;;
+    false) runner_json='{"DisableUpdate":false,"AgentName":"fixture"}' ;;
+    string) runner_json='{"DisableUpdate":"true","AgentName":"fixture"}' ;;
+    null) runner_json='{"DisableUpdate":null,"AgentName":"fixture"}' ;;
+    malformed) runner_json='{"DisableUpdate":true' ;;
+    mixed-case) runner_json='{"DisableUpdate":true,"disableUpdate":false,"AgentName":"fixture"}' ;;
+    *) return 2 ;;
+  esac
+  runner_encoded="$(printf '%s' "$runner_json" | base64 -w0)"
+  credentials_encoded="$(printf '{"token":"%s"}' "$JIT_TEST_JIT_SECRET" | base64 -w0)"
+  rsa_encoded="$(printf '{"privateKey":"%s-rsa"}' "$JIT_TEST_JIT_SECRET" | base64 -w0)"
+  jq -cn --arg runner "$runner_encoded" --arg credentials "$credentials_encoded" --arg rsa "$rsa_encoded" \
+    '{".runner":$runner,".credentials":$credentials,".credentials_rsaparams":$rsa}' | base64 -w0
+}
+
+JIT_TEST_ENCODED_CONFIG="$(jit_test_encoded_config valid)"
+JIT_TEST_SECRET_BASE64="$(printf '%s' "$JIT_TEST_JIT_SECRET" | base64 -w0)"
+JIT_TEST_CREDENTIALS_BLOB="$(printf '{"token":"%s"}' "$JIT_TEST_JIT_SECRET" | base64 -w0)"
+JIT_TEST_RSA_BLOB="$(printf '{"privateKey":"%s-rsa"}' "$JIT_TEST_JIT_SECRET" | base64 -w0)"
 JIT_TEST_BOUNDARY="$(jq -cn --arg image "ghcr.io/mufarri7/mazaya-ci@sha256:$(printf 'a%.0s' {1..64})" \
   '{schema_version:1,job_container_required:true,job_container_images:[$image],service_container_images:[],container_options:[],container_volumes:[]}')"
 
@@ -78,6 +103,44 @@ SLIRP_UNSAFE_STATUS="$TMP/slirp-unsafe.status"
 jit_validate_slirp_capability_status "$SLIRP_SAFE_STATUS" || fail "minimal slirp runtime capabilities were rejected"
 sed "s/^CapEff:.*/CapEff:\t${JIT_SLIRP_STARTUP_CAP_MASK}/" "$SLIRP_SAFE_STATUS" >"$SLIRP_UNSAFE_STATUS"
 if jit_validate_slirp_capability_status "$SLIRP_UNSAFE_STATUS"; then fail "slirp runtime retained startup capabilities"; fi
+
+jit_validate_jit_config_disable_update "$JIT_TEST_ENCODED_CONFIG" \
+  || fail "valid DisableUpdate=true JIT configuration was rejected"
+for invalid_jit_mode in missing false string null malformed mixed-case; do
+  invalid_jit_config="$(jit_test_encoded_config "$invalid_jit_mode")"
+  validation_output="$TMP/jit-config-${invalid_jit_mode}.output"
+  if jit_validate_jit_config_disable_update "$invalid_jit_config" >"$validation_output" 2>&1; then
+    fail "unsafe JIT DisableUpdate configuration was accepted: $invalid_jit_mode"
+  fi
+  if grep -F "$JIT_TEST_JIT_SECRET" "$validation_output" >/dev/null 2>&1 || grep -F "$JIT_TEST_SECRET_BASE64" "$validation_output" >/dev/null 2>&1 || \
+     grep -F "$JIT_TEST_CREDENTIALS_BLOB" "$validation_output" >/dev/null 2>&1 || grep -F "$JIT_TEST_RSA_BLOB" "$validation_output" >/dev/null 2>&1; then
+    fail "JIT configuration validator leaked credential material: $invalid_jit_mode"
+  fi
+done
+if printf '%s' "$JIT_TEST_ENCODED_CONFIG" | python3 "$ROOT/libexec/validate_jit_config.py" invalid >/dev/null 2>&1; then
+  fail "JIT configuration validator accepted an invalid size contract"
+fi
+if jit_validate_jit_config_disable_update "${JIT_TEST_ENCODED_CONFIG%?}"; then
+  fail "truncated JIT configuration was accepted"
+fi
+
+jit_validate_pinned_runner_release "$JIT_PINNED_RUNNER_VERSION" x64 \
+  "actions-runner-linux-x64-${JIT_PINNED_RUNNER_VERSION}.tar.gz" \
+  "https://github.com/actions/runner/releases/download/v${JIT_PINNED_RUNNER_VERSION}/actions-runner-linux-x64-${JIT_PINNED_RUNNER_VERSION}.tar.gz" \
+  "sha256:${JIT_PINNED_RUNNER_X64_SHA256}" || fail "reviewed JIT runner release identity was rejected"
+if jit_validate_pinned_runner_release 2.336.0 x64 "actions-runner-linux-x64-2.336.0.tar.gz" \
+  "https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-linux-x64-2.336.0.tar.gz" \
+  "sha256:${JIT_PINNED_RUNNER_X64_SHA256}"; then fail "JIT runner version drift was accepted"; fi
+if jit_validate_pinned_runner_release "$JIT_PINNED_RUNNER_VERSION" x64 \
+  "actions-runner-linux-x64-${JIT_PINNED_RUNNER_VERSION}.tar.gz" \
+  "https://github.com/actions/runner/releases/download/v${JIT_PINNED_RUNNER_VERSION}/actions-runner-linux-x64-${JIT_PINNED_RUNNER_VERSION}.tar.gz" \
+  "sha256:$(printf '0%.0s' {1..64})"; then fail "JIT runner digest drift was accepted"; fi
+drift_runner_seed="$TMP/drift-actions-runner"
+cp -a "$ROOT/tests/fixtures/fake-actions-runner" "$drift_runner_seed"
+sed -i 's/2\.337\.0/2.336.0/' "$drift_runner_seed/bin/Runner.Listener"
+if jit_verify_runner_seed_version "$drift_runner_seed" "$JIT_PINNED_RUNNER_VERSION"; then
+  fail "JIT runner listener version drift was accepted"
+fi
 
 JIT_TEST_EVIDENCE_DIR="$TMP/evidence"
 JIT_TEST_EVIDENCE_ARCHIVE="$TMP/evidence.zip"
@@ -237,15 +300,17 @@ jit_api() {
       [[ "$intent_found" == 1 ]] || fail "remote JIT creation happened before durable registration intent"
       exec 7>"$TMP/fake-api.lock"; flock 7
       remote="$(cat "$JIT_TEST_REMOTE_RUNNERS_FILE")"
+      encoded_config="$JIT_TEST_ENCODED_CONFIG"
+      [[ "$JIT_TEST_CASE" != jit-config-disable-update-false ]] || encoded_config="$(jit_test_encoded_config false)"
       if [[ "$JIT_TEST_CASE" == default-labels ]]; then
         temporary="${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp.$$"
         jq --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '. + [{id:($id|tonumber),name:$name,status:"offline",busy:false,ephemeral:true,labels:[{name:$label},{name:"self-hosted"}]}]' <<<"$remote" >"$temporary"; mv "$temporary" "$JIT_TEST_REMOTE_RUNNERS_FILE"
-        jq -cn --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '{runner:{id:($id|tonumber),name:$name,status:"offline",busy:false,labels:[{name:$label,type:"custom"},{name:"self-hosted",type:"read-only"}]},encoded_jit_config:"jit-secret-material-123456"}'
+        jq -cn --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" --arg encoded_config "$encoded_config" '{runner:{id:($id|tonumber),name:$name,status:"offline",busy:false,labels:[{name:$label,type:"custom"},{name:"self-hosted",type:"read-only"}]},encoded_jit_config:$encoded_config}'
       else
         temporary="${JIT_TEST_REMOTE_RUNNERS_FILE}.tmp.$$"
         jq --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '. + [{id:($id|tonumber),name:$name,status:"offline",busy:false,ephemeral:true,labels:[{name:$label}]}]' <<<"$remote" >"$temporary"; mv "$temporary" "$JIT_TEST_REMOTE_RUNNERS_FILE"
         if [[ "$JIT_TEST_CASE" == registration-lost-response ]]; then flock -u 7; return 75; fi
-        jq -cn --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" '{runner:{id:($id|tonumber),name:$name,status:"offline",busy:false,labels:[{name:$label,type:"custom"}]},encoded_jit_config:"jit-secret-material-123456"}'
+        jq -cn --arg id "$runner_id" --arg name "$runner_name" --arg label "$runner_label" --arg encoded_config "$encoded_config" '{runner:{id:($id|tonumber),name:$name,status:"offline",busy:false,labels:[{name:$label,type:"custom"}]},encoded_jit_config:$encoded_config}'
       fi
       flock -u 7
       ;;
@@ -327,11 +392,13 @@ if jit_validate_admission_lease_state "$legacy_admission"; then fail "legacy adm
 
 # Staging uses explicit output parameters so controller state is not lost when
 # the helper is invoked from a subshell or a command substitution.
+jit_prepare_runner_cache
 staged_test_helper=""; staged_test_manifest=""
 jit_stage_runtime_helper staged_test_helper staged_test_manifest
 [[ "$staged_test_helper" == "$JIT_RUNTIME_HELPER" && "$staged_test_manifest" == "$JIT_RUNTIME_MANIFEST" ]] || fail "runtime staging output parameters were not propagated"
 [[ "$staged_test_manifest" == "$JIT_DATA_DIR/runtime/manifest.json" ]] || fail "fake runtime manifest path is not private and deterministic"
 jq -e --arg helper "$staged_test_helper" --arg helper_sha256 "$(sha256sum "$staged_test_helper" | awk '{print $1}')" '.helper==$helper and .helper_sha256==$helper_sha256' "$staged_test_manifest" >/dev/null || fail "runtime manifest does not bind the staged helper"
+jit_prepare_admission_runtime
 short_runtime="$(jit_worker_runtime_dir "$JIT_ADMISSION_ID" worker-001 "$JIT_BOUNDARY_ROOT/$JIT_ADMISSION_ID/worker-001.boundary")"
 jit_assert_unix_socket_path "$short_runtime/docker.sock" || fail "worker Docker socket path exceeded AF_UNIX limits"
 long_socket="/tmp/$(printf 'x%.0s' $(seq 1 120))"
@@ -476,7 +543,13 @@ assert_eq "$(jq -r .status "$state_one")" "finished"
 [[ ! -e "$(jq -r .runtime_dir "$state_one")" ]] || fail "successful worker runtime survived cleanup"
 diagnostics="${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/worker-001"
 [[ -r "$diagnostics/runner/runner.log" ]] || fail "external runner diagnostics were not retained"
-if grep -R -F 'jit-secret-material-123456' "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1; then fail "JIT secret leaked into state or diagnostics"; fi
+if grep -R -F "$JIT_TEST_JIT_SECRET" "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1 || \
+   grep -R -F "$JIT_TEST_SECRET_BASE64" "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1 || \
+   grep -R -F "$JIT_TEST_CREDENTIALS_BLOB" "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1 || \
+   grep -R -F "$JIT_TEST_RSA_BLOB" "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1 || \
+   grep -R -F "$JIT_TEST_ENCODED_CONFIG" "$JIT_DATA_DIR" "$JIT_DIAGNOSTICS_DIR" >/dev/null 2>&1; then
+  fail "JIT credential material leaked into state or diagnostics"
+fi
 if grep -q '^ACTIONS_RUNNER_INPUT_JITCONFIG=' "$diagnostics/runner/job-environment.log"; then fail "JIT configuration reached the job environment"; fi
 
 state_two="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-002)"
@@ -559,6 +632,22 @@ jit_write_worker_state "$state_six" cancelled "simulated controller cancellation
 jit_cleanup_worker_state "$state_six"
 assert_eq "$(jq -r .status "$state_six")" "cleaned"
 [[ ! -e "$(jq -r .root "$state_six")" ]] || fail "cancelled worker boundary survived cleanup"
+
+legacy_runner_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-096)"
+jit_write_worker_state "$legacy_runner_state" allocated
+jit_plan_worker_identity "$legacy_runner_state" 96
+jit_create_worker_boundary "$legacy_runner_state"
+jq 'del(.runner_version,.runner_arch,.runner_asset,.runner_asset_digest) | .status="running"' "$legacy_runner_state" | jit_atomic_write "$legacy_runner_state"
+if jit_validate_worker_journal "$legacy_runner_state" "$JIT_ADMISSION_ID"; then
+  fail "active legacy worker without runner provenance was admitted"
+fi
+legacy_runner_root="$(jq -r .root "$legacy_runner_state")"
+jit_cleanup_worker_state "$legacy_runner_state"
+assert_eq "$(jq -r .status "$legacy_runner_state")" cleaned
+[[ ! -e "$legacy_runner_root" ]] || fail "legacy worker cleanup left its deterministic boundary"
+jit_validate_worker_journal "$legacy_runner_state" "$JIT_ADMISSION_ID" \
+  || fail "terminal legacy worker history blocked admission after safe cleanup"
+rm -f "$legacy_runner_state"
 
 state_seven="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-007)"
 jit_write_worker_state "$state_seven" allocated
@@ -744,6 +833,24 @@ for registration_fault in registration-after-intent-before-request registration-
   registration_sequence=$((registration_sequence + 1))
 done
 
+registration_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-099)"
+jit_write_worker_state "$registration_state" allocated; jit_plan_worker_identity "$registration_state" 99
+JIT_TEST_CASE=jit-config-disable-update-false
+validation_output="$TMP/jit-config-integration.output"
+if (jit_generate_config "$(jq -r .user "$registration_state")" "$registration_state") >"$validation_output" 2>&1; then
+  fail "generate-jitconfig accepted DisableUpdate=false"
+fi
+JIT_TEST_CASE=valid
+jq -e '.status=="registered" and (.runner_id|type=="number")' "$registration_state" >/dev/null \
+  || fail "unsafe JIT configuration runner identity was not persisted for cleanup"
+if grep -F "$JIT_TEST_JIT_SECRET" "$validation_output" >/dev/null 2>&1 || grep -F "$JIT_TEST_SECRET_BASE64" "$validation_output" >/dev/null 2>&1 || \
+   grep -F "$JIT_TEST_CREDENTIALS_BLOB" "$validation_output" >/dev/null 2>&1 || grep -F "$JIT_TEST_RSA_BLOB" "$validation_output" >/dev/null 2>&1; then
+  fail "unsafe JIT configuration failure leaked credential material"
+fi
+jit_cleanup_worker_state "$registration_state"
+assert_eq "$(jq -r .status "$registration_state")" cleaned
+assert_eq "$(jq 'length' "$JIT_TEST_REMOTE_RUNNERS_FILE")" 0
+
 registration_state="$(jit_worker_state_file "$JIT_ADMISSION_ID" worker-103)"
 jit_write_worker_state "$registration_state" allocated; jit_plan_worker_identity "$registration_state" 103
 JIT_TEST_CASE=registration-lost-response
@@ -826,16 +933,38 @@ DRY_RUN=0
 JIT_TEST_CONTROLLER=1
 jit_launch_admission "$JIT_ADMISSION_ID" --slots 2 --auth test >/dev/null
 assert_eq "$(jq -r .status "$JIT_ADMISSION_FILE")" "completed"
-jq -e '.runtime_selection.helper and .runtime_selection.manifest and (.runtime_selection.helper_sha256|test("^[0-9a-f]{64}$")) and .runtime_selection.controller_revision and (.runtime_selection.controller_digest|test("^[0-9a-f]{64}$"))' "$JIT_ADMISSION_FILE" >/dev/null || fail "controller did not persist immutable runtime selection before spawning workers"
+jq -e --arg version "$JIT_PINNED_RUNNER_VERSION" --arg arch "$(arch_name)" --arg digest "sha256:$(jit_pinned_runner_digest "$(arch_name)")" '
+  .runtime_selection.helper and .runtime_selection.manifest and (.runtime_selection.helper_sha256|test("^[0-9a-f]{64}$")) and
+  .runtime_selection.controller_revision and (.runtime_selection.controller_digest|test("^[0-9a-f]{64}$")) and
+  .runtime_selection.runner_version==$version and .runtime_selection.runner_arch==$arch and
+  .runtime_selection.runner_asset==("actions-runner-linux-"+$arch+"-"+$version+".tar.gz") and .runtime_selection.runner_asset_digest==$digest
+' "$JIT_ADMISSION_FILE" >/dev/null || fail "controller did not persist immutable controller and runner selection before spawning workers"
 first_runtime_helper="$(jq -r '.runtime_selection.helper' "$JIT_ADMISSION_FILE")"
-jq -s -e --arg helper "$first_runtime_helper" '[.[] | select(.sequence>=8) | .runtime_helper == $helper] | all' "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json >/dev/null || fail "worker journal did not inherit the immutable runtime selection"
-jq -e '.runtime_selection.controller_manifest.files|length==7 and all(.[]; (.path|startswith("libexec/")) and (.sha256|test("^[0-9a-f]{64}$")))' "$JIT_ADMISSION_FILE" >/dev/null || fail "runtime provenance did not persist the deterministic libexec manifest"
+jq -s -e --arg helper "$first_runtime_helper" --arg version "$JIT_PINNED_RUNNER_VERSION" --arg digest "sha256:$(jit_pinned_runner_digest "$(arch_name)")" \
+  '[.[] | select(.sequence>=8 and .worker_id!="worker-096") | .runtime_helper == $helper and .runner_version==$version and .runner_asset_digest==$digest] | all' \
+  "$(jit_worker_state_dir "$JIT_ADMISSION_ID")"/worker-*.json >/dev/null || fail "worker journal did not inherit immutable controller and runner provenance"
+jq -e '.runtime_selection.controller_manifest.files|length==8 and all(.[]; (.path|startswith("libexec/")) and (.sha256|test("^[0-9a-f]{64}$")) )' "$JIT_ADMISSION_FILE" >/dev/null || fail "runtime provenance did not persist the deterministic libexec manifest"
 provenance_root="$TMP/runtime-provenance"
 mkdir -p "$provenance_root/libexec"
 while IFS= read -r provenance_file; do cp "$ROOT/libexec/$provenance_file" "$provenance_root/libexec/$provenance_file"; done < <(jit_runtime_critical_libexec_files)
 GHRCTL_JIT_PROVENANCE_ROOT="$provenance_root"
 jit_load_admission "$JIT_ADMISSION_ID"
 jit_validate_admission_runtime_selection || fail "unchanged runtime provenance failed validation"
+admission_provenance_backup="$TMP/admission-provenance.json"
+cp "$JIT_ADMISSION_FILE" "$admission_provenance_backup"
+for runner_field in runner_version runner_asset_digest; do
+  jq --arg field "$runner_field" '.runtime_selection[$field]="drift"' "$admission_provenance_backup" | jit_atomic_write "$JIT_ADMISSION_FILE"
+  jit_load_admission "$JIT_ADMISSION_ID"
+  if jit_validate_admission_runtime_selection >/dev/null 2>&1; then fail "admission runner provenance drift was accepted: $runner_field"; fi
+  cp "$admission_provenance_backup" "$JIT_ADMISSION_FILE"
+done
+jit_load_admission "$JIT_ADMISSION_ID"
+worker_provenance_sample="$(find "$(jit_worker_state_dir "$JIT_ADMISSION_ID")" -type f -name 'worker-*.json' | sort | tail -n1)"
+worker_provenance_backup="$TMP/worker-provenance.json"
+cp "$worker_provenance_sample" "$worker_provenance_backup"
+jq '.runner_asset_digest="sha256:0000000000000000000000000000000000000000000000000000000000000000"' "$worker_provenance_backup" | jit_atomic_write "$worker_provenance_sample"
+if jit_validate_worker_journal "$worker_provenance_sample" "$JIT_ADMISSION_ID"; then fail "worker runner digest drift was accepted"; fi
+cp "$worker_provenance_backup" "$worker_provenance_sample"
 while IFS= read -r provenance_file; do
   printf '# mutation\n' >>"$provenance_root/libexec/$provenance_file"
   if jit_validate_admission_runtime_selection >/dev/null 2>&1; then fail "mutated runtime-critical libexec helper remained trusted: $provenance_file"; fi
@@ -866,6 +995,21 @@ JSON_OUTPUT=1
 status_json="$(jit_status_admission "$JIT_ADMISSION_ID")"
 jq -e '.admission.id and (.workers|length)>=3' >/dev/null <<<"$status_json" || fail "JIT status JSON is invalid"
 JSON_OUTPUT=0
+
+if command -v zstd >/dev/null 2>&1; then
+  jit_backup="$TMP/jit-secret-free-backup.tar.zst"
+  jit_backup_validation="$TMP/jit-secret-free-backup-validation"
+  mkdir -p "$jit_backup_validation/extract"
+  create_backup_archive project fixture "$jit_backup" >/dev/null
+  validate_backup_archive "$jit_backup" "$jit_backup_validation" >/dev/null
+  if grep -R -F "$JIT_TEST_JIT_SECRET" "$jit_backup_validation/extract" >/dev/null 2>&1 || \
+     grep -R -F "$JIT_TEST_SECRET_BASE64" "$jit_backup_validation/extract" >/dev/null 2>&1 || \
+     grep -R -F "$JIT_TEST_CREDENTIALS_BLOB" "$jit_backup_validation/extract" >/dev/null 2>&1 || \
+     grep -R -F "$JIT_TEST_RSA_BLOB" "$jit_backup_validation/extract" >/dev/null 2>&1 || \
+     grep -R -F "$JIT_TEST_ENCODED_CONFIG" "$jit_backup_validation/extract" >/dev/null 2>&1; then
+    fail "JIT credential material leaked into a managed backup"
+  fi
+fi
 
 jit_rollback_project mazaya-test --auth test >/dev/null 2>&1
 assert_eq "$(jq -r .status "$(jit_migration_file mazaya-test)")" "rolled-back"

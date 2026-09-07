@@ -7,10 +7,15 @@ runner_dir="$2"
 runtime_dir="$3"
 docker_socket="$4"
 network_ready="$5"
+expected_runner_version="$6"
 worker_user="$(id -un)"
 
 IFS= read -r jit_config
 [[ "$jit_config" =~ ^[A-Za-z0-9_+/=-]+$ && ${#jit_config} -ge 16 ]]
+[[ "$expected_runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+actual_runner_version="$("$runner_dir/bin/Runner.Listener" --version 2>/dev/null)"
+[[ "$actual_runner_version" == "$expected_runner_version" ]] || { printf 'Runner version differs from reviewed provenance.\n' >&2; exit 78; }
+printf 'JIT runner version before job: %s\n' "$actual_runner_version"
 
 export HOME="$home" USER="$worker_user" LOGNAME="$worker_user"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -42,4 +47,10 @@ set +e
 wait "$runner_pid"
 runner_status=$?
 set -e
+actual_runner_version="$("$runner_dir/bin/Runner.Listener" --version 2>/dev/null)" || actual_runner_version=""
+if [[ "$actual_runner_version" != "$expected_runner_version" ]]; then
+  printf 'Runner version changed during the JIT job.\n' >&2
+  exit 78
+fi
+printf 'JIT runner version after job: %s\n' "$actual_runner_version"
 exit "$runner_status"

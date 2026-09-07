@@ -384,17 +384,24 @@ jit_load_admission() {
   JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST="$(jq -r '.runtime_selection.controller_digest // empty' "$file")"
   JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST="$(jq -c '.runtime_selection.controller_manifest // empty' "$file")"
   JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256="$(jq -r '.runtime_selection.controller_manifest_sha256 // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_VERSION="$(jq -r '.runtime_selection.runner_version // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_ARCH="$(jq -r '.runtime_selection.runner_arch // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_ASSET="$(jq -r '.runtime_selection.runner_asset // empty' "$file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_DIGEST="$(jq -r '.runtime_selection.runner_asset_digest // empty' "$file")"
   jit_load_policy "$JIT_ADMISSION_PROJECT"
   [[ "$JIT_ADMISSION_REPOSITORY" == "$JIT_POLICY_REPOSITORY" ]] || die "Admission policy repository drift detected."
 }
 
 jit_persist_admission_runtime_selection() {
   local helper="$1" manifest="$2" helper_sha256="$3" controller_revision="$4" controller_digest="$5" controller_manifest="${6:-}" controller_manifest_sha256="${7:-}"
+  local runner_version="${8:-}" runner_arch="${9:-}" runner_asset="${10:-}" runner_asset_digest="${11:-}"
   [[ -n "$controller_manifest" ]] || controller_manifest="$(jit_runtime_controller_manifest_json)"
   [[ -n "$controller_manifest_sha256" ]] || controller_manifest_sha256="$(printf '%s' "$controller_manifest" | sha256sum | awk '{print $1}')"
+  [[ -n "$runner_version" && -n "$runner_arch" && -n "$runner_asset" && -n "$runner_asset_digest" ]] || die "JIT runner provenance is required before persisting runtime selection."
   jq --arg helper "$helper" --arg manifest "$manifest" --arg helper_sha256 "$helper_sha256" \
-    --arg controller_revision "$controller_revision" --arg controller_digest "$controller_digest" --arg controller_manifest_sha256 "$controller_manifest_sha256" --argjson controller_manifest "$controller_manifest" --arg now "$(utc_now)" '
-    .runtime_selection={helper:$helper,manifest:$manifest,helper_sha256:$helper_sha256,controller_revision:$controller_revision,controller_digest:$controller_digest,controller_manifest:$controller_manifest,controller_manifest_sha256:$controller_manifest_sha256,staged_at:$now} |
+    --arg controller_revision "$controller_revision" --arg controller_digest "$controller_digest" --arg controller_manifest_sha256 "$controller_manifest_sha256" --argjson controller_manifest "$controller_manifest" \
+    --arg runner_version "$runner_version" --arg runner_arch "$runner_arch" --arg runner_asset "$runner_asset" --arg runner_asset_digest "$runner_asset_digest" --arg now "$(utc_now)" '
+    .runtime_selection={helper:$helper,manifest:$manifest,helper_sha256:$helper_sha256,controller_revision:$controller_revision,controller_digest:$controller_digest,controller_manifest:$controller_manifest,controller_manifest_sha256:$controller_manifest_sha256,runner_version:$runner_version,runner_arch:$runner_arch,runner_asset:$runner_asset,runner_asset_digest:$runner_asset_digest,staged_at:$now} |
     .updated_at=$now
   ' "$JIT_ADMISSION_FILE" | jit_atomic_write "$JIT_ADMISSION_FILE"
   JIT_ADMISSION_RUNTIME_HELPER="$helper"
@@ -404,6 +411,10 @@ jit_persist_admission_runtime_selection() {
   JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST="$controller_digest"
   JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST="$controller_manifest"
   JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256="$controller_manifest_sha256"
+  JIT_ADMISSION_RUNTIME_RUNNER_VERSION="$runner_version"
+  JIT_ADMISSION_RUNTIME_RUNNER_ARCH="$runner_arch"
+  JIT_ADMISSION_RUNTIME_RUNNER_ASSET="$runner_asset"
+  JIT_ADMISSION_RUNTIME_RUNNER_DIGEST="$runner_asset_digest"
 }
 
 jit_admission_worker_state_is_live() {
@@ -445,9 +456,19 @@ jit_validate_worker_journal() {
     ((.sandbox_slirp_pid==null and .sandbox_slirp_boot_id==null and .sandbox_slirp_start_ticks==null) or
       ((.sandbox_slirp_pid|type=="number" and floor==. and .>=1) and
        (.sandbox_slirp_boot_id|type=="string" and length>0) and
-       (.sandbox_slirp_start_ticks|type=="number" and floor==. and .>=1)))
+       (.sandbox_slirp_start_ticks|type=="number" and floor==. and .>=1))) and
+    (((.runner_version|type=="string" and length>0) and
+      (.runner_arch|type=="string" and length>0) and
+      (.runner_asset|type=="string" and length>0) and
+      (.runner_asset_digest|type=="string" and test("^sha256:[0-9a-f]{64}$"))) or
+     ((.status|test("^(cleaned|finished|failed)$")) and
+      (.runner_version==null) and (.runner_arch==null) and (.runner_asset==null) and (.runner_asset_digest==null)))
   ' "$state_file" >/dev/null 2>&1 || return 1
-  (jit_validate_worker_identity_state "$state_file" >/dev/null 2>&1)
+  if jq -e '.runner_version==null and .runner_arch==null and .runner_asset==null and .runner_asset_digest==null' "$state_file" >/dev/null; then
+    (jit_validate_worker_identity_state "$state_file" allow-legacy-runner-cleanup >/dev/null 2>&1)
+  else
+    (jit_validate_worker_identity_state "$state_file" >/dev/null 2>&1)
+  fi
 }
 
 jit_validate_all_worker_journals() {

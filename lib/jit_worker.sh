@@ -31,7 +31,7 @@ jit_runtime_controller_digest() {
 jit_runtime_critical_libexec_files() {
   # Keep this allow-list explicit so a newly added executable cannot silently
   # escape the controller provenance contract.
-  printf '%s\n' bounded_log.py collect_diagnostics.py durable_directory.py durable_replace.py jit-worker-sandbox.sh prune_diagnostics.py validate_id_map.py
+  printf '%s\n' bounded_log.py collect_diagnostics.py durable_directory.py durable_replace.py jit-worker-sandbox.sh prune_diagnostics.py validate_id_map.py validate_jit_config.py
 }
 
 jit_runtime_controller_manifest_json() {
@@ -194,11 +194,15 @@ jit_stage_runtime_helper() {
     jit_verify_staged_runtime_helper "$staged" "$helper_hash" || die "Staged JIT sandbox helper failed its hash or ownership check."
   fi
   manifest_path="${runtime_dir}/manifest.json"
+  [[ -n "$JIT_RUNNER_SELECTED_VERSION" && -n "$JIT_RUNNER_SELECTED_ARCH" && -n "$JIT_RUNNER_SELECTED_ASSET" && -n "$JIT_RUNNER_SELECTED_DIGEST" ]] \
+    || die "Reviewed JIT runner provenance must be selected before runtime staging."
   jq -n --arg revision "$controller_revision" --arg controller_digest "$controller_digest" --arg controller_manifest_sha256 "$controller_manifest_sha256" \
     --argjson controller_manifest "$controller_manifest" \
     --arg helper "$staged" --arg helper_sha256 "$helper_hash" --arg source_root "$GHRCTL_ROOT" \
+    --arg runner_version "$JIT_RUNNER_SELECTED_VERSION" --arg runner_arch "$JIT_RUNNER_SELECTED_ARCH" \
+    --arg runner_asset "$JIT_RUNNER_SELECTED_ASSET" --arg runner_asset_digest "$JIT_RUNNER_SELECTED_DIGEST" \
     --arg now "$(utc_now)" \
-    '{schema_version:1,controller_revision:$revision,controller_digest:$controller_digest,controller_manifest:$controller_manifest,controller_manifest_sha256:$controller_manifest_sha256,helper:$helper,helper_sha256:$helper_sha256,source_root:$source_root,staged_at:$now}' \
+    '{schema_version:2,controller_revision:$revision,controller_digest:$controller_digest,controller_manifest:$controller_manifest,controller_manifest_sha256:$controller_manifest_sha256,helper:$helper,helper_sha256:$helper_sha256,source_root:$source_root,runner_version:$runner_version,runner_arch:$runner_arch,runner_asset:$runner_asset,runner_asset_digest:$runner_asset_digest,staged_at:$now}' \
     | durable_replace_file "$manifest_path" 644
   if jit_test_backend_enabled; then
     [[ -f "$manifest_path" && ! -L "$manifest_path" && "$(stat -c '%a' "$manifest_path")" == 644 ]] || die "JIT runtime test manifest is invalid."
@@ -217,6 +221,10 @@ jit_stage_runtime_helper() {
 jit_validate_admission_runtime_selection() {
   local manifest="$JIT_ADMISSION_RUNTIME_MANIFEST" current_revision current_digest current_manifest current_manifest_sha256
   [[ -n "$JIT_ADMISSION_RUNTIME_HELPER" && -n "$manifest" && "$JIT_ADMISSION_RUNTIME_HELPER_SHA256" =~ ^[0-9a-f]{64}$ && -n "$JIT_ADMISSION_RUNTIME_CONTROLLER_REVISION" && "$JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST" =~ ^[0-9a-f]{64}$ && -n "${JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST:-}" && "$JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  jit_validate_pinned_runner_release "$JIT_ADMISSION_RUNTIME_RUNNER_VERSION" "$JIT_ADMISSION_RUNTIME_RUNNER_ARCH" \
+    "$JIT_ADMISSION_RUNTIME_RUNNER_ASSET" \
+    "https://github.com/actions/runner/releases/download/v${JIT_ADMISSION_RUNTIME_RUNNER_VERSION}/${JIT_ADMISSION_RUNTIME_RUNNER_ASSET}" \
+    "$JIT_ADMISSION_RUNTIME_RUNNER_DIGEST" || return 1
   [[ "$manifest" == "${JIT_RUNTIME_DIR}/manifest.json" || (jit_test_backend_enabled && "$manifest" == "${GHRCTL_JIT_RUNTIME_DIR:-${JIT_DATA_DIR}/runtime}/manifest.json") ]] || return 1
   if jit_test_backend_enabled; then
     [[ -f "$manifest" && ! -L "$manifest" && "$(stat -c '%a' "$manifest")" == 644 ]] || return 1
@@ -238,7 +246,9 @@ jit_validate_admission_runtime_selection() {
   jq -e --arg revision "$JIT_ADMISSION_RUNTIME_CONTROLLER_REVISION" --arg digest "$JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST" \
     --argjson controller_manifest "$JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST" --arg controller_manifest_sha256 "$JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256" \
     --arg helper "$JIT_ADMISSION_RUNTIME_HELPER" --arg helper_sha256 "$JIT_ADMISSION_RUNTIME_HELPER_SHA256" \
-    '.schema_version == 1 and .controller_revision == $revision and .controller_digest == $digest and .controller_manifest == $controller_manifest and .controller_manifest_sha256 == $controller_manifest_sha256 and .helper == $helper and .helper_sha256 == $helper_sha256' \
+    --arg runner_version "$JIT_ADMISSION_RUNTIME_RUNNER_VERSION" --arg runner_arch "$JIT_ADMISSION_RUNTIME_RUNNER_ARCH" \
+    --arg runner_asset "$JIT_ADMISSION_RUNTIME_RUNNER_ASSET" --arg runner_asset_digest "$JIT_ADMISSION_RUNTIME_RUNNER_DIGEST" \
+    '.schema_version == 2 and .controller_revision == $revision and .controller_digest == $digest and .controller_manifest == $controller_manifest and .controller_manifest_sha256 == $controller_manifest_sha256 and .helper == $helper and .helper_sha256 == $helper_sha256 and .runner_version == $runner_version and .runner_arch == $runner_arch and .runner_asset == $runner_asset and .runner_asset_digest == $runner_asset_digest' \
     "$manifest" >/dev/null
 }
 
@@ -254,7 +264,8 @@ jit_prepare_admission_runtime() {
   controller_digest="$(jit_runtime_controller_digest)"
   controller_manifest="$(jit_runtime_controller_manifest_json)"
   controller_manifest_sha256="$(printf '%s' "$controller_manifest" | sha256sum | awk '{print $1}')"
-  jit_persist_admission_runtime_selection "$helper" "$manifest" "$helper_sha256" "$controller_revision" "$controller_digest" "$controller_manifest" "$controller_manifest_sha256"
+  jit_persist_admission_runtime_selection "$helper" "$manifest" "$helper_sha256" "$controller_revision" "$controller_digest" "$controller_manifest" "$controller_manifest_sha256" \
+    "$JIT_RUNNER_SELECTED_VERSION" "$JIT_RUNNER_SELECTED_ARCH" "$JIT_RUNNER_SELECTED_ASSET" "$JIT_RUNNER_SELECTED_DIGEST"
 }
 
 jit_fault_inject() {
@@ -350,18 +361,41 @@ jit_require_clean_host_runtime() {
 }
 
 jit_prepare_runner_cache() {
+  local arch version asset url digest cache temporary tarball expected actual
+  arch="$(arch_name)"
+  version="$JIT_PINNED_RUNNER_VERSION"
+  asset="actions-runner-linux-${arch}-${version}.tar.gz"
+  expected="$(jit_pinned_runner_digest "$arch")" || die "The host architecture has no reviewed JIT runner digest."
+  digest="sha256:${expected}"
+  url="https://github.com/actions/runner/releases/download/v${version}/${asset}"
+  jit_validate_pinned_runner_release "$version" "$arch" "$asset" "$url" "$digest" \
+    || die "The reviewed JIT runner release identity is invalid."
+
+  if [[ -n "${JIT_ADMISSION_RUNTIME_RUNNER_VERSION:-}" ]]; then
+    [[ "$JIT_ADMISSION_RUNTIME_RUNNER_VERSION" == "$version" && "$JIT_ADMISSION_RUNTIME_RUNNER_ARCH" == "$arch" && \
+       "$JIT_ADMISSION_RUNTIME_RUNNER_ASSET" == "$asset" && "$JIT_ADMISSION_RUNTIME_RUNNER_DIGEST" == "$digest" ]] \
+      || die "Persisted JIT runner provenance does not match the reviewed trust contract."
+  fi
+  JIT_RUNNER_SELECTED_VERSION="$version"
+  JIT_RUNNER_SELECTED_ARCH="$arch"
+  JIT_RUNNER_SELECTED_ASSET="$asset"
+  JIT_RUNNER_SELECTED_DIGEST="$digest"
+
   if jit_test_backend_enabled; then
     [[ -n "${GHRCTL_JIT_FAKE_RUNNER_ROOT:-}" && -x "${GHRCTL_JIT_FAKE_RUNNER_ROOT}/run.sh" ]] || die "The fake JIT runner root is unavailable."
+    jit_verify_runner_seed_version "$GHRCTL_JIT_FAKE_RUNNER_ROOT" "$version" \
+      || die "The fake JIT runner does not match the reviewed version."
     JIT_RUNNER_SEED="$GHRCTL_JIT_FAKE_RUNNER_ROOT"
     return 0
   fi
-  local arch version asset url digest cache temporary tarball expected actual
-  arch="$(arch_name)"
-  IFS=$'\t' read -r version asset url digest < <(latest_runner_release "$arch")
-  [[ "$digest" =~ ^sha256:([a-fA-F0-9]{64})$ ]] || die "JIT mode refuses a runner release without an official SHA-256 digest."
-  expected="${BASH_REMATCH[1],,}"
+  IFS=$'\t' read -r version asset url digest < <(runner_release_by_version "$version" "$arch")
+  jit_validate_pinned_runner_release "$version" "$arch" "$asset" "$url" "$digest" \
+    || die "GitHub's release metadata differs from the reviewed JIT runner identity."
   cache="${JIT_RUNNER_CACHE_DIR}/actions-runner-${version}-${arch}"
-  if [[ -x "$cache/run.sh" && -r "$cache/.ghrctl-digest" && "$(<"$cache/.ghrctl-digest")" == "$expected" ]]; then
+  if [[ -x "$cache/run.sh" && -r "$cache/.ghrctl-version" && -r "$cache/.ghrctl-arch" && -r "$cache/.ghrctl-asset" && -r "$cache/.ghrctl-digest" && \
+        "$(<"$cache/.ghrctl-version")" == "$version" && "$(<"$cache/.ghrctl-arch")" == "$arch" && \
+        "$(<"$cache/.ghrctl-asset")" == "$asset" && "$(<"$cache/.ghrctl-digest")" == "$digest" ]] && \
+        jit_verify_runner_seed_version "$cache" "$version"; then
     JIT_RUNNER_SEED="$cache"
     return 0
   fi
@@ -373,7 +407,11 @@ jit_prepare_runner_cache() {
   mkdir -p "$temporary/extract"
   tar -xzf "$tarball" -C "$temporary/extract"
   rm -f "$tarball"
-  printf '%s\n' "$expected" >"$temporary/extract/.ghrctl-digest"
+  jit_verify_runner_seed_version "$temporary/extract" "$version" || die "Downloaded JIT runner binary version mismatch."
+  printf '%s\n' "$version" >"$temporary/extract/.ghrctl-version"
+  printf '%s\n' "$arch" >"$temporary/extract/.ghrctl-arch"
+  printf '%s\n' "$asset" >"$temporary/extract/.ghrctl-asset"
+  printf '%s\n' "$digest" >"$temporary/extract/.ghrctl-digest"
   chmod -R a-w "$temporary/extract"
   if [[ -e "$cache" ]]; then
     rm -rf --one-file-system "$cache"
@@ -382,6 +420,31 @@ jit_prepare_runner_cache() {
   rmdir "$temporary"
   chown -R root:root "$cache"
   JIT_RUNNER_SEED="$cache"
+}
+
+jit_pinned_runner_digest() {
+  case "$1" in
+    x64) printf '%s' "$JIT_PINNED_RUNNER_X64_SHA256" ;;
+    arm64) printf '%s' "$JIT_PINNED_RUNNER_ARM64_SHA256" ;;
+    arm) printf '%s' "$JIT_PINNED_RUNNER_ARM_SHA256" ;;
+    *) return 1 ;;
+  esac
+}
+
+jit_validate_pinned_runner_release() {
+  local version="$1" arch="$2" asset="$3" url="$4" digest="$5" expected
+  expected="$(jit_pinned_runner_digest "$arch")" || return 1
+  [[ "$version" == "$JIT_PINNED_RUNNER_VERSION" && \
+     "$asset" == "actions-runner-linux-${arch}-${version}.tar.gz" && \
+     "$url" == "https://github.com/actions/runner/releases/download/v${version}/${asset}" && \
+     "$digest" == "sha256:${expected}" ]]
+}
+
+jit_verify_runner_seed_version() {
+  local seed="$1" expected="$2" actual
+  [[ -x "$seed/bin/Runner.Listener" ]] || return 1
+  actual="$("$seed/bin/Runner.Listener" --version 2>/dev/null)" || return 1
+  [[ "$actual" == "$expected" ]]
 }
 
 jit_worker_identity() {
@@ -471,7 +534,7 @@ jit_worker_resource_may_exist() {
 }
 
 jit_plan_worker_identity() {
-  local state_file="$1" sequence="$2" admission_id worker_id user uid subid_start worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready runtime_helper runtime_manifest runtime_helper_sha256 runtime_controller_revision runtime_controller_digest runtime_controller_manifest runtime_controller_manifest_sha256
+  local state_file="$1" sequence="$2" admission_id worker_id user uid subid_start worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready runtime_helper runtime_manifest runtime_helper_sha256 runtime_controller_revision runtime_controller_digest runtime_controller_manifest runtime_controller_manifest_sha256 runner_version runner_arch runner_asset runner_asset_digest
   admission_id="$JIT_ADMISSION_ID"; worker_id="${state_file##*/}"; worker_id="${worker_id%.json}"
   user="$(jit_worker_identity "$admission_id" "$sequence")"; uid="$(jit_worker_uid "$admission_id" "$sequence")"; subid_start="$(jit_worker_subid_start "$admission_id" "$sequence")"
   worker_root="${JIT_BOUNDARY_ROOT}/${admission_id}/${worker_id}.boundary"; home="${worker_root}/home"; runner_dir="${home}/actions-runner"
@@ -484,6 +547,10 @@ jit_plan_worker_identity() {
   runtime_controller_digest="${JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST:-}"
   runtime_controller_manifest="${JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST:-}"
   runtime_controller_manifest_sha256="${JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256:-}"
+  runner_version="${JIT_ADMISSION_RUNTIME_RUNNER_VERSION:-}"
+  runner_arch="${JIT_ADMISSION_RUNTIME_RUNNER_ARCH:-}"
+  runner_asset="${JIT_ADMISSION_RUNTIME_RUNNER_ASSET:-}"
+  runner_asset_digest="${JIT_ADMISSION_RUNTIME_RUNNER_DIGEST:-}"
   if [[ -z "$runtime_helper" ]]; then
     runtime_helper="$(jq -r '.runtime_selection.helper // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
     runtime_manifest="$(jq -r '.runtime_selection.manifest // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
@@ -492,14 +559,22 @@ jit_plan_worker_identity() {
     runtime_controller_digest="$(jq -r '.runtime_selection.controller_digest // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
     runtime_controller_manifest="$(jq -c '.runtime_selection.controller_manifest // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
     runtime_controller_manifest_sha256="$(jq -r '.runtime_selection.controller_manifest_sha256 // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
+    runner_version="$(jq -r '.runtime_selection.runner_version // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
+    runner_arch="$(jq -r '.runtime_selection.runner_arch // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
+    runner_asset="$(jq -r '.runtime_selection.runner_asset // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
+    runner_asset_digest="$(jq -r '.runtime_selection.runner_asset_digest // empty' "${JIT_ADMISSION_FILE:-/dev/null}" 2>/dev/null || true)"
   fi
+  jit_validate_pinned_runner_release "$runner_version" "$runner_arch" "$runner_asset" \
+    "https://github.com/actions/runner/releases/download/v${runner_version}/${runner_asset}" "$runner_asset_digest" \
+    || die "Admission runner provenance is unavailable or outside the reviewed trust contract."
   jit_assert_safe_worker_path "$worker_root"
   jq --arg sequence "$sequence" --arg user "$user" --arg uid "$uid" --arg subid_start "$subid_start" --arg subid_count "$JIT_POLICY_SUBID_COUNT" \
     --arg real_start "$JIT_POLICY_REAL_ID_START" --arg real_end "$JIT_POLICY_REAL_ID_END" --arg sub_start "$JIT_POLICY_SUBID_START" --arg sub_end "$JIT_POLICY_SUBID_END" \
     --arg group "$user" --arg root "$worker_root" --arg home "$home" --arg runner_dir "$runner_dir" --arg runtime_dir "$runtime_dir" --arg docker_socket "$docker_socket" \
     --arg unit "$unit" --arg network_unit "$network_unit" --arg network_ready "$network_ready" --arg now "$(utc_now)" \
     --arg runtime_helper "$runtime_helper" --arg runtime_manifest "$runtime_manifest" --arg runtime_helper_sha256 "$runtime_helper_sha256" \
-    --arg runtime_controller_revision "$runtime_controller_revision" --arg runtime_controller_digest "$runtime_controller_digest" --arg runtime_controller_manifest "$runtime_controller_manifest" --arg runtime_controller_manifest_sha256 "$runtime_controller_manifest_sha256" '
+    --arg runtime_controller_revision "$runtime_controller_revision" --arg runtime_controller_digest "$runtime_controller_digest" --arg runtime_controller_manifest "$runtime_controller_manifest" --arg runtime_controller_manifest_sha256 "$runtime_controller_manifest_sha256" \
+    --arg runner_version "$runner_version" --arg runner_arch "$runner_arch" --arg runner_asset "$runner_asset" --arg runner_asset_digest "$runner_asset_digest" '
     .sequence=($sequence|tonumber) | .user=$user | .uid=($uid|tonumber) | .gid=($uid|tonumber) | .group=$group | .root=$root | .home=$home |
     .runner_dir=$runner_dir | .runtime_dir=$runtime_dir | .docker_socket=$docker_socket | .sandbox_unit=$unit | .sandbox_network_unit=$network_unit | .network_ready=$network_ready |
     .subuid={start:($subid_start|tonumber),count:($subid_count|tonumber)} | .subgid={start:($subid_start|tonumber),count:($subid_count|tonumber)} |
@@ -511,6 +586,7 @@ jit_plan_worker_identity() {
     .runtime_controller_digest=(if $runtime_controller_digest=="" then null else $runtime_controller_digest end) |
     .runtime_controller_manifest=(if $runtime_controller_manifest=="" then null else ($runtime_controller_manifest|fromjson) end) |
     .runtime_controller_manifest_sha256=(if $runtime_controller_manifest_sha256=="" then null else $runtime_controller_manifest_sha256 end) |
+    .runner_version=$runner_version | .runner_arch=$runner_arch | .runner_asset=$runner_asset | .runner_asset_digest=$runner_asset_digest |
     .status="creating" | .creation_stage="identity-persisted" | .updated_at=$now
   ' "$state_file" | jit_atomic_write "$state_file"
 }
@@ -641,6 +717,9 @@ jit_create_worker_boundary() {
 
 jit_generate_config() {
   local worker_name="$1" state_file="$2" body response label_count returned_label returned_type returned_name returned_status returned_busy request_id
+  # JIT configuration is a credential bundle; tracing must never expose it.
+  { set +x; } 2>/dev/null
+  jit_validate_admission_runtime_selection || die "Persisted JIT runtime selection is unavailable or tampered."
   jit_reconcile_registration "$state_file" before-create
   request_id="$(printf '%s\0%s\0%s\0%s' "$JIT_ADMISSION_ID" "$(jq -r .worker_id "$state_file")" "$worker_name" "$JIT_ADMISSION_LABEL" | sha256sum | awk '{print $1}')"
   jq --arg name "$worker_name" --arg label "$JIT_ADMISSION_LABEL" --arg admission_id "$JIT_ADMISSION_ID" --arg request_id "$request_id" --arg now "$(utc_now)" '
@@ -657,15 +736,25 @@ jit_generate_config() {
   label_count="$(jq '.runner.labels | length' <<<"$response")"
   returned_label="$(jq -r '.runner.labels[0].name' <<<"$response")"
   returned_type="$(jq -r '.runner.labels[0].type // empty' <<<"$response")"
+  unset response
   [[ "$JIT_GENERATED_RUNNER_ID" =~ ^[1-9][0-9]*$ ]] || die "GitHub returned an invalid JIT runner ID."
   jq --arg runner_id "$JIT_GENERATED_RUNNER_ID" --arg now "$(utc_now)" '
     .status="registered" | .runner_id=($runner_id|tonumber) | .registration.status="registered" | .registration.runner_id=($runner_id|tonumber) | .updated_at=$now
   ' "$state_file" | jit_atomic_write "$state_file"
   jit_fault_inject registration-after-id-persisted
   [[ "$returned_name" == "$worker_name" && "$returned_status" == offline && "$returned_busy" == false ]] || die "GitHub returned an unexpected JIT runner identity or state."
-  [[ "$JIT_GENERATED_CONFIG" =~ ^[A-Za-z0-9_+/=-]+$ && ${#JIT_GENERATED_CONFIG} -ge 16 ]] || die "GitHub returned an invalid JIT configuration."
+  [[ "$JIT_GENERATED_CONFIG" =~ ^[A-Za-z0-9+/=]+$ && ${#JIT_GENERATED_CONFIG} -ge 16 && ${#JIT_GENERATED_CONFIG} -le $JIT_CONFIG_MAX_ENCODED_BYTES ]] \
+    || die "GitHub returned an invalid JIT configuration."
+  jit_validate_jit_config_disable_update "$JIT_GENERATED_CONFIG" \
+    || die "GitHub JIT configuration does not enforce the reviewed no-self-update contract."
   [[ "$label_count" == 1 && "$returned_label" == "$JIT_ADMISSION_LABEL" && "$returned_type" == custom ]] || die "GitHub JIT response contains default, reusable, or non-custom labels."
-  unset response
+}
+
+jit_validate_jit_config_disable_update() {
+  local encoded_config="$1"
+  { set +x; } 2>/dev/null
+  [[ "$encoded_config" =~ ^[A-Za-z0-9+/=]+$ && ${#encoded_config} -ge 16 && ${#encoded_config} -le $JIT_CONFIG_MAX_ENCODED_BYTES ]] || return 1
+  printf '%s' "$encoded_config" | python3 "${GHRCTL_ROOT}/libexec/validate_jit_config.py" "$JIT_CONFIG_MAX_ENCODED_BYTES" >/dev/null 2>&1
 }
 
 jit_write_worker_state() {
@@ -686,17 +775,23 @@ jit_write_worker_state() {
     ' "$state_file" | jit_atomic_write "$state_file"
   else
     jq -n --argjson schema_version "$JIT_WORKER_SCHEMA_VERSION" --arg admission_id "$JIT_ADMISSION_ID" --arg worker_id "${state_file##*/}" --arg status "$status" --arg now "$(utc_now)" --arg note "$note" \
-      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,gid:null,group:null,root:null,home:null,runner_dir:null,runtime_dir:null,docker_socket:null,runtime_helper:null,runtime_manifest:null,runtime_helper_sha256:null,runtime_controller_revision:null,runtime_controller_digest:null,runtime_controller_manifest:null,runtime_controller_manifest_sha256:null,sandbox_unit:null,sandbox_network_unit:null,network_ready:null,subuid:null,subgid:null,id_pools:null,creation_stage:null,resources:{boundary:{mutation_started:false,created:false},group:{mutation_started:false,created:false},user:{mutation_started:false,created:false},subids:{mutation_started:false,created:false},runner_seed:{mutation_started:false,created:false},runtime:{mutation_started:false,created:false},sandbox_unit:{mutation_started:false,created:false,identity_persisted:false},network_unit:{mutation_started:false,created:false,identity_persisted:false}},registration:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,worker_pid:null,worker_boot_id:null,worker_start_ticks:null,controller_process:null,controller_children:[],sandbox_main_pid:null,sandbox_main_boot_id:null,sandbox_main_start_ticks:null,sandbox_slirp_pid:null,sandbox_slirp_boot_id:null,sandbox_slirp_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' \
+      '{schema_version:$schema_version,admission_id:$admission_id,worker_id:($worker_id|sub("\\.json$";"")),sequence:null,user:null,uid:null,gid:null,group:null,root:null,home:null,runner_dir:null,runtime_dir:null,docker_socket:null,runtime_helper:null,runtime_manifest:null,runtime_helper_sha256:null,runtime_controller_revision:null,runtime_controller_digest:null,runtime_controller_manifest:null,runtime_controller_manifest_sha256:null,runner_version:null,runner_arch:null,runner_asset:null,runner_asset_digest:null,sandbox_unit:null,sandbox_network_unit:null,network_ready:null,subuid:null,subgid:null,id_pools:null,creation_stage:null,resources:{boundary:{mutation_started:false,created:false},group:{mutation_started:false,created:false},user:{mutation_started:false,created:false},subids:{mutation_started:false,created:false},runner_seed:{mutation_started:false,created:false},runtime:{mutation_started:false,created:false},sandbox_unit:{mutation_started:false,created:false,identity_persisted:false},network_unit:{mutation_started:false,created:false,identity_persisted:false}},registration:null,runner_id:null,controller_pid:null,controller_boot_id:null,controller_start_ticks:null,worker_pid:null,worker_boot_id:null,worker_start_ticks:null,controller_process:null,controller_children:[],sandbox_main_pid:null,sandbox_main_boot_id:null,sandbox_main_start_ticks:null,sandbox_slirp_pid:null,sandbox_slirp_boot_id:null,sandbox_slirp_start_ticks:null,status:$status,created_at:$now,updated_at:$now,note:(if $note=="" then null else $note end)}' \
       | jit_atomic_write "$state_file"
   fi
 }
 
 jit_execute_runner() {
-  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper docker_socket_guard main_pid=0 main_ticks="" slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file protected_path network_inaccessible_paths=""
+  local state_file="$1" config="$2" user group worker_root home runner_dir runtime_dir docker_socket unit network_unit network_ready diagnostic_dir controller_log runtime_helper docker_socket_guard main_pid=0 main_ticks="" slirp_pid=0 slirp_ticks="" boot_id="" systemd_pid exit_code attempt runner_pid runner_boot runner_ticks config_file protected_path network_inaccessible_paths="" runner_version runner_arch runner_asset runner_digest runner_url
   local -a network_systemd_args network_protected_paths
   jit_load_worker_identity "$state_file"
   user="$JIT_WORKER_USER"; group="$JIT_WORKER_GROUP"; worker_root="$JIT_WORKER_ROOT"; home="$JIT_WORKER_HOME"
   runner_dir="$JIT_WORKER_RUNNER_DIR"; runtime_dir="$JIT_WORKER_RUNTIME_DIR"; docker_socket="$JIT_WORKER_DOCKER_SOCKET"; unit="$JIT_WORKER_SANDBOX_UNIT"; network_unit="$JIT_WORKER_SANDBOX_NETWORK_UNIT"; network_ready="$JIT_WORKER_NETWORK_READY"
+  runner_version="$(jq -r '.runner_version // empty' "$state_file")"; runner_arch="$(jq -r '.runner_arch // empty' "$state_file")"
+  runner_asset="$(jq -r '.runner_asset // empty' "$state_file")"; runner_digest="$(jq -r '.runner_asset_digest // empty' "$state_file")"
+  runner_url="https://github.com/actions/runner/releases/download/v${runner_version}/${runner_asset}"
+  jit_validate_pinned_runner_release "$runner_version" "$runner_arch" "$runner_asset" "$runner_url" "$runner_digest" \
+    || die "Persisted worker runner provenance is unavailable or tampered."
+  jit_verify_runner_seed_version "$runner_dir" "$runner_version" || die "Worker runner binary version differs from persisted provenance."
   if jit_test_backend_enabled; then
     config_file="${worker_root}/controller/.jitconfig"
     printf '%s\n' "$config" >"$config_file"
@@ -717,6 +812,10 @@ jit_execute_runner() {
   JIT_ADMISSION_RUNTIME_CONTROLLER_DIGEST="$(jq -r '.runtime_controller_digest // empty' "$state_file")"
   JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST="$(jq -c '.runtime_controller_manifest // empty' "$state_file")"
   JIT_ADMISSION_RUNTIME_CONTROLLER_MANIFEST_SHA256="$(jq -r '.runtime_controller_manifest_sha256 // empty' "$state_file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_VERSION="$(jq -r '.runner_version // empty' "$state_file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_ARCH="$(jq -r '.runner_arch // empty' "$state_file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_ASSET="$(jq -r '.runner_asset // empty' "$state_file")"
+  JIT_ADMISSION_RUNTIME_RUNNER_DIGEST="$(jq -r '.runner_asset_digest // empty' "$state_file")"
   jit_validate_admission_runtime_selection || die "Persisted JIT runtime selection is unavailable or tampered."
   runtime_helper="$JIT_ADMISSION_RUNTIME_HELPER"
   diagnostic_dir="${JIT_DIAGNOSTICS_DIR}/${JIT_ADMISSION_ID}/$(jq -r .worker_id "$state_file")"
@@ -742,7 +841,7 @@ jit_execute_runner() {
     --property="InaccessiblePaths=-/run/user" \
     --property="RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK" \
     --property=Delegate=yes --property=KillMode=control-group --property=UMask=0077 \
-    "$runtime_helper" "$home" "$runner_dir" "$runtime_dir" "$docker_socket" "$network_ready" \
+    "$runtime_helper" "$home" "$runner_dir" "$runtime_dir" "$docker_socket" "$network_ready" "$runner_version" \
     2>&1 | python3 "${GHRCTL_ROOT}/libexec/bounded_log.py" "$controller_log" "$JIT_DIAGNOSTIC_MAX_FILE_BYTES" &
   systemd_pid=$!
   set -e
@@ -971,7 +1070,7 @@ jit_reconcile_registration() {
 }
 
 jit_validate_worker_identity_state() {
-  local state_file="$1" admission_id worker_id sequence expected_user expected_uid expected_subid expected_root expected_home expected_runner expected_runtime expected_socket expected_unit expected_network_unit real_start real_end sub_start sub_end sub_count seed slots
+  local state_file="$1" legacy_mode="${2:-}" admission_id worker_id sequence expected_user expected_uid expected_subid expected_root expected_home expected_runner expected_runtime expected_socket expected_unit expected_network_unit real_start real_end sub_start sub_end sub_count seed slots runner_version runner_arch runner_asset runner_digest runner_url
   admission_id="$(jq -r .admission_id "$state_file")"; worker_id="$(jq -r .worker_id "$state_file")"; sequence="$(jq -r '.sequence // empty' "$state_file")"
   [[ "$admission_id" =~ ^[0-9a-f]{64}$ && "$worker_id" =~ ^worker-[0-9]{3,}$ && "$sequence" =~ ^[1-9][0-9]*$ ]] || return 1
   real_start="$(jq -r '.id_pools.real.start // empty' "$state_file")"; real_end="$(jq -r '.id_pools.real.end // empty' "$state_file")"
@@ -989,6 +1088,14 @@ jit_validate_worker_identity_state() {
      "$(jq -r .network_ready "$state_file")" == "${expected_root}/controller/network.ready" && "$(jq -r .subuid.start "$state_file")" == "$expected_subid" &&
      "$(jq -r .subgid.start "$state_file")" == "$expected_subid" && "$(jq -r .subuid.count "$state_file")" == "$sub_count" &&
      "$(jq -r .subgid.count "$state_file")" == "$sub_count" ]] || return 1
+  runner_version="$(jq -r '.runner_version // empty' "$state_file")"; runner_arch="$(jq -r '.runner_arch // empty' "$state_file")"
+  runner_asset="$(jq -r '.runner_asset // empty' "$state_file")"; runner_digest="$(jq -r '.runner_asset_digest // empty' "$state_file")"
+  if [[ -z "$runner_version$runner_arch$runner_asset$runner_digest" && "$legacy_mode" == allow-legacy-runner-cleanup ]]; then
+    : # Legacy recovery may derive destructive path authority only from the pre-existing deterministic identity fields.
+  else
+    runner_url="https://github.com/actions/runner/releases/download/v${runner_version}/${runner_asset}"
+    jit_validate_pinned_runner_release "$runner_version" "$runner_arch" "$runner_asset" "$runner_url" "$runner_digest" || return 1
+  fi
   jit_assert_safe_worker_path "$expected_root"
   jit_validate_worker_runtime_socket "$expected_runtime" "$expected_socket" "$admission_id" "$worker_id"
 }
@@ -1102,7 +1209,7 @@ jit_destroy_worker_boundary() {
 jit_cleanup_worker_state() {
   local state_file="$1" user uid group worker_root runner_dir runner_id worker_id admission_id cleanup_failed=0 current_pid recorded_pid
   [[ -r "$state_file" ]] || return 0
-  if [[ "$(jq -r '.sequence // empty' "$state_file")" != "" ]] && ! jit_validate_worker_identity_state "$state_file"; then
+  if [[ "$(jq -r '.sequence // empty' "$state_file")" != "" ]] && ! jit_validate_worker_identity_state "$state_file" allow-legacy-runner-cleanup; then
     jit_write_worker_state "$state_file" cleanup-pending "Persisted worker identity failed deterministic validation."
     return 1
   fi
@@ -1425,8 +1532,8 @@ jit_run_controller_loop() (
   trap - ERR EXIT
   local slots="$1" state_dir started consumed_at now jobs target_jobs queued active desired total terminal run run_status run_conclusion final_status sequence existing_workers
   trap 'controller_exit_code=$?; trap - EXIT INT TERM; jit_controller_exit_cleanup "$controller_exit_code"; exit "$controller_exit_code"' EXIT
-  jit_prepare_admission_runtime
   jit_prepare_runner_cache
+  jit_prepare_admission_runtime
   state_dir="$(jit_worker_state_dir "$JIT_ADMISSION_ID")"
   durable_ensure_dir "$state_dir" 700
   jit_set_admission_status running

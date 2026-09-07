@@ -40,6 +40,8 @@
 - exact slirp startup capability inventory plus a PID-identity-bound runtime proof that only `CAP_NET_BIND_SERVICE` remains;
 - trusted, digest-pinned, option/volume-free job-container admission with host-mode execution rejected;
 - no candidate mount of runner `.runner`, `.credentials*`, JIT configuration, supervisor processes, or the Rootless Docker control socket;
+- Actions Runner `2.337.0` is an explicit JIT TCB dependency, with exact-tag official SHA-256 verification and admission/worker provenance binding;
+- fail-closed in-memory JIT-envelope validation requires `DisableUpdate=true`, while version-before/after evidence detects listener drift without recording credentials;
 - file- and parent-directory-fsynced critical JIT state replacement.
 
 ## Residual risks
