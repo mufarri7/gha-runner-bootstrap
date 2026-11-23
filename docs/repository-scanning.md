@@ -70,3 +70,18 @@ Before applying a generated profile, verify:
 5. no workflow assumes Rootful Docker or `/var/run/docker.sock`;
 6. public-repository workflow triggers cannot expose the persistent runner to untrusted code;
 7. custom dependencies not recognized by the scanner are installed through a reviewed, reproducible mechanism.
+
+
+## Explicit PHP and Docker extraction
+
+The scanner reports \`shivammathur/setup-php\` workflow steps with literal PHP versions,
+extension sets and optional Composer/tool declarations. Variable-driven values remain
+manual-review items. It never runs setup-php or adds sudo access to runner users;
+operator-provisioned PHP or a reviewed containerized job may be required.
+
+Docker image references are read only from explicit Dockerfile FROM statements,
+workflow/container/Compose \`image:\` fields, recognized Testcontainers constructors,
+and literal \`docker run\`/\`docker pull\` invocations. Arbitrary PHP DSNs and URL
+schemes are not interpreted as container images (e.g. \`mysql:host\`).
+Extraction remains bounded, static-only and intentionally heuristic: complex
+shell substitutions and dynamic image names require operator review.
