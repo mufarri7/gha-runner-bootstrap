@@ -142,7 +142,195 @@ prompt_secret() {
   local __var="$1" text="$2" value
   (( NON_INTERACTIVE == 0 )) || die "Secrets must be supplied interactively; non-interactive secret input is intentionally unsupported."
   read -r -s -p "$text: " value
-  printf '\n'
+  printf '\n' >&2
+  value="${value%
+}
+
+init_dirs() {
+  mkdir -p "$PROJECTS_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR" "$LOG_DIR" "$BASE_ROOT" "$(dirname "$LOCK_FILE")" "$(dirname "$LOG_FILE")"
+  chmod 700 "$STATE_DIR" "$PROJECTS_DIR" "$DATA_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR"
+  chmod 755 "$LOG_DIR" "$BASE_ROOT"
+  touch "$LOG_FILE" "$LOCK_FILE"
+  chmod 600 "$LOG_FILE" "$LOCK_FILE"
+}
+
+acquire_lock() {
+  need_root
+  [[ "$LOCK_HELD" == "1" ]] && return 0
+  init_dirs
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Another ghrctl process is running."
+  LOCK_HELD=1
+}
+
+begin_operation() {
+  local name="$1" args_json="${2:-[]}" id
+  [[ -n "$ACTIVE_OPERATION_FILE" ]] && return 0
+  [[ "${GHRCTL_RESUMING:-0}" == "1" ]] && return 0
+  init_dirs
+  id="$(date -u +'%Y%m%dT%H%M%SZ')-$$-${RANDOM}"
+  ACTIVE_OPERATION_FILE="${OPERATIONS_DIR}/${id}.json"
+  jq -n \
+    --arg id "$id" --arg name "$name" --arg status running \
+    --arg started_at "$(utc_now)" --arg version "$GHRCTL_VERSION" \
+    --argjson args "$args_json" \
+    '{schema_version:1,id:$id,name:$name,args:$args,status:$status,started_at:$started_at,updated_at:$started_at,ghrctl_version:$version,exit_code:null,note:null}' \
+    >"$ACTIVE_OPERATION_FILE"
+  chmod 600 "$ACTIVE_OPERATION_FILE"
+  ln -sfn "$ACTIVE_OPERATION_FILE" "${OPERATIONS_DIR}/last.json"
+  json_log info operation_started "Operation started: $name" "$(jq -cn --arg id "$id" --arg name "$name" '{operation_id:$id,operation:$name}')"
+}
+
+mark_operation() {
+  local status="$1" exit_code="${2:-0}" note="${3:-}"
+  [[ -n "$ACTIVE_OPERATION_FILE" && -f "$ACTIVE_OPERATION_FILE" ]] || return 0
+  local tmp="${ACTIVE_OPERATION_FILE}.tmp"
+  jq \
+    --arg status "$status" --arg updated_at "$(utc_now)" --arg note "$note" \
+    --argjson exit_code "$exit_code" \
+    '.status=$status | .updated_at=$updated_at | .exit_code=$exit_code | .note=(if $note=="" then null else $note end)' \
+    "$ACTIVE_OPERATION_FILE" >"$tmp" && mv "$tmp" "$ACTIVE_OPERATION_FILE"
+}
+
+resume_last_operation() {
+  need_root
+  init_dirs
+  local last="${OPERATIONS_DIR}/last.json" name args
+  [[ -r "$last" ]] || die "No operation journal is available."
+  name="$(jq -r .name "$last")"
+  args="$(jq -c .args "$last")"
+  [[ "$(jq -r .status "$last")" != "completed" ]] || die "The last operation already completed."
+  info "Resuming idempotent operation: $name"
+  export GHRCTL_RESUMING=1
+  mapfile -t _resume_args < <(jq -r '.[]' <<<"$args")
+  dispatch_command "$name" "${_resume_args[@]}"
+}
+\r'}"
+  [[ "$value" != *
+}
+
+init_dirs() {
+  mkdir -p "$PROJECTS_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR" "$LOG_DIR" "$BASE_ROOT" "$(dirname "$LOCK_FILE")" "$(dirname "$LOG_FILE")"
+  chmod 700 "$STATE_DIR" "$PROJECTS_DIR" "$DATA_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR"
+  chmod 755 "$LOG_DIR" "$BASE_ROOT"
+  touch "$LOG_FILE" "$LOCK_FILE"
+  chmod 600 "$LOG_FILE" "$LOCK_FILE"
+}
+
+acquire_lock() {
+  need_root
+  [[ "$LOCK_HELD" == "1" ]] && return 0
+  init_dirs
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Another ghrctl process is running."
+  LOCK_HELD=1
+}
+
+begin_operation() {
+  local name="$1" args_json="${2:-[]}" id
+  [[ -n "$ACTIVE_OPERATION_FILE" ]] && return 0
+  [[ "${GHRCTL_RESUMING:-0}" == "1" ]] && return 0
+  init_dirs
+  id="$(date -u +'%Y%m%dT%H%M%SZ')-$$-${RANDOM}"
+  ACTIVE_OPERATION_FILE="${OPERATIONS_DIR}/${id}.json"
+  jq -n \
+    --arg id "$id" --arg name "$name" --arg status running \
+    --arg started_at "$(utc_now)" --arg version "$GHRCTL_VERSION" \
+    --argjson args "$args_json" \
+    '{schema_version:1,id:$id,name:$name,args:$args,status:$status,started_at:$started_at,updated_at:$started_at,ghrctl_version:$version,exit_code:null,note:null}' \
+    >"$ACTIVE_OPERATION_FILE"
+  chmod 600 "$ACTIVE_OPERATION_FILE"
+  ln -sfn "$ACTIVE_OPERATION_FILE" "${OPERATIONS_DIR}/last.json"
+  json_log info operation_started "Operation started: $name" "$(jq -cn --arg id "$id" --arg name "$name" '{operation_id:$id,operation:$name}')"
+}
+
+mark_operation() {
+  local status="$1" exit_code="${2:-0}" note="${3:-}"
+  [[ -n "$ACTIVE_OPERATION_FILE" && -f "$ACTIVE_OPERATION_FILE" ]] || return 0
+  local tmp="${ACTIVE_OPERATION_FILE}.tmp"
+  jq \
+    --arg status "$status" --arg updated_at "$(utc_now)" --arg note "$note" \
+    --argjson exit_code "$exit_code" \
+    '.status=$status | .updated_at=$updated_at | .exit_code=$exit_code | .note=(if $note=="" then null else $note end)' \
+    "$ACTIVE_OPERATION_FILE" >"$tmp" && mv "$tmp" "$ACTIVE_OPERATION_FILE"
+}
+
+resume_last_operation() {
+  need_root
+  init_dirs
+  local last="${OPERATIONS_DIR}/last.json" name args
+  [[ -r "$last" ]] || die "No operation journal is available."
+  name="$(jq -r .name "$last")"
+  args="$(jq -c .args "$last")"
+  [[ "$(jq -r .status "$last")" != "completed" ]] || die "The last operation already completed."
+  info "Resuming idempotent operation: $name"
+  export GHRCTL_RESUMING=1
+  mapfile -t _resume_args < <(jq -r '.[]' <<<"$args")
+  dispatch_command "$name" "${_resume_args[@]}"
+}
+\n'* && "$value" != *
+}
+
+init_dirs() {
+  mkdir -p "$PROJECTS_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR" "$LOG_DIR" "$BASE_ROOT" "$(dirname "$LOCK_FILE")" "$(dirname "$LOG_FILE")"
+  chmod 700 "$STATE_DIR" "$PROJECTS_DIR" "$DATA_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR"
+  chmod 755 "$LOG_DIR" "$BASE_ROOT"
+  touch "$LOG_FILE" "$LOCK_FILE"
+  chmod 600 "$LOG_FILE" "$LOCK_FILE"
+}
+
+acquire_lock() {
+  need_root
+  [[ "$LOCK_HELD" == "1" ]] && return 0
+  init_dirs
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "Another ghrctl process is running."
+  LOCK_HELD=1
+}
+
+begin_operation() {
+  local name="$1" args_json="${2:-[]}" id
+  [[ -n "$ACTIVE_OPERATION_FILE" ]] && return 0
+  [[ "${GHRCTL_RESUMING:-0}" == "1" ]] && return 0
+  init_dirs
+  id="$(date -u +'%Y%m%dT%H%M%SZ')-$$-${RANDOM}"
+  ACTIVE_OPERATION_FILE="${OPERATIONS_DIR}/${id}.json"
+  jq -n \
+    --arg id "$id" --arg name "$name" --arg status running \
+    --arg started_at "$(utc_now)" --arg version "$GHRCTL_VERSION" \
+    --argjson args "$args_json" \
+    '{schema_version:1,id:$id,name:$name,args:$args,status:$status,started_at:$started_at,updated_at:$started_at,ghrctl_version:$version,exit_code:null,note:null}' \
+    >"$ACTIVE_OPERATION_FILE"
+  chmod 600 "$ACTIVE_OPERATION_FILE"
+  ln -sfn "$ACTIVE_OPERATION_FILE" "${OPERATIONS_DIR}/last.json"
+  json_log info operation_started "Operation started: $name" "$(jq -cn --arg id "$id" --arg name "$name" '{operation_id:$id,operation:$name}')"
+}
+
+mark_operation() {
+  local status="$1" exit_code="${2:-0}" note="${3:-}"
+  [[ -n "$ACTIVE_OPERATION_FILE" && -f "$ACTIVE_OPERATION_FILE" ]] || return 0
+  local tmp="${ACTIVE_OPERATION_FILE}.tmp"
+  jq \
+    --arg status "$status" --arg updated_at "$(utc_now)" --arg note "$note" \
+    --argjson exit_code "$exit_code" \
+    '.status=$status | .updated_at=$updated_at | .exit_code=$exit_code | .note=(if $note=="" then null else $note end)' \
+    "$ACTIVE_OPERATION_FILE" >"$tmp" && mv "$tmp" "$ACTIVE_OPERATION_FILE"
+}
+
+resume_last_operation() {
+  need_root
+  init_dirs
+  local last="${OPERATIONS_DIR}/last.json" name args
+  [[ -r "$last" ]] || die "No operation journal is available."
+  name="$(jq -r .name "$last")"
+  args="$(jq -c .args "$last")"
+  [[ "$(jq -r .status "$last")" != "completed" ]] || die "The last operation already completed."
+  info "Resuming idempotent operation: $name"
+  export GHRCTL_RESUMING=1
+  mapfile -t _resume_args < <(jq -r '.[]' <<<"$args")
+  dispatch_command "$name" "${_resume_args[@]}"
+}
+\r'* ]] || die "Secret input contains a newline."
   [[ -n "$value" ]] || die "A value is required."
   printf -v "$__var" '%s' "$value"
 }

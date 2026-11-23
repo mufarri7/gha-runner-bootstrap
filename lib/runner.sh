@@ -83,8 +83,12 @@ find_incomplete_runner_dir() {
 
 write_install_state() {
   local dir="$1" status="$2" name="$3" version="${4:-}" service="${5:-}"
-  jq -n --arg status "$status" --arg name "$name" --arg version "$version" --arg service "$service" --arg updated_at "$(utc_now)" '{schema_version:1,status:$status,runner_name:$name,runner_version:(if $version=="" then null else $version end),service:(if $service=="" then null else $service end),updated_at:$updated_at}' >"${dir}/.ghrctl-install.json"
-  chmod 600 "${dir}/.ghrctl-install.json"
+  # Write runner-owned state with runner privileges, avoiding root-level symlink writes.
+  local tmp="${dir}/.ghrctl-install.json.tmp.$"
+  jq -n --arg status "$status" --arg name "$name" --arg version "$version" --arg service "$service" --arg updated_at "$(utc_now)" '{schema_version:1,status:$status,runner_name:$name,runner_version:(if $version=="" then null else $version end),service:(if $service=="" then null else $service end),updated_at:$updated_at}' |
+    runuser -u "$RUNNER_USER" -- tee "$tmp" >/dev/null
+  runuser -u "$RUNNER_USER" -- chmod 600 "$tmp"
+  runuser -u "$RUNNER_USER" -- mv -f -- "$tmp" "${dir}/.ghrctl-install.json"
 }
 
 runner_dirs() {
@@ -95,13 +99,6 @@ runner_dirs() {
 runner_name_from_dir() {
   local dir="$1"
   jq -r '.agentName // empty' "$dir/.runner" 2>/dev/null || true
-}
-
-runner_service_from_dir() {
-  local dir="$1"
-  if [[ -r "$dir/.service" ]]; then
-    cat "$dir/.service"
-  fi
 }
 
 runner_is_busy() {
@@ -121,8 +118,8 @@ wait_runner_idle() {
 
 configure_runner_service_environment() {
   local dir="$1" user="$2" rootless="$3" service uid home service_dir
-  service="$(runner_service_from_dir "$dir")"; [[ -n "$service" ]] || die "Runner service file was not created: $dir/.service"
-  uid="$(id -u "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"; service_dir="/etc/systemd/system/${service}.d"
+  service="$(ensure_runner_service "$dir" "$user")"
+  uid="$(id -u "$user")"; home="$(getent passwd "$user" | cut -d: -f6)"; service_dir="$(ghrctl_unit_dir)/${service}.d"
   mkdir -p "$service_dir"
   {
     echo '[Service]'
@@ -176,7 +173,8 @@ add_runner() {
     mark_operation completed 0 "dry-run"; return 0
   fi
 
-  mkdir -p "$dir"; chown -R "$RUNNER_USER:$RUNNER_USER" "$dir"; chmod 750 "$dir"
+  runuser -u "$RUNNER_USER" -- mkdir -p -- "$dir"
+  runuser -u "$RUNNER_USER" -- chmod 750 "$dir"
   arch="$(arch_name)"
   if [[ ! -x "$dir/config.sh" ]]; then
     IFS=$'\t' read -r version asset url digest < <(latest_runner_release "$arch")
@@ -189,7 +187,7 @@ add_runner() {
       actual="$(sha256sum "$tarball" | awk '{print $1}')"; [[ "${actual,,}" == "${expected,,}" ]] || die "Runner SHA-256 digest mismatch."
       success "Verified runner asset SHA-256 digest."
     else
-      warn "GitHub API did not expose an asset digest; HTTPS transport was used but no release digest was available."
+      die "Runner asset has no verifiable SHA-256 digest; refusing installation."
     fi
     runuser -u "$RUNNER_USER" -- tar -xzf "$tarball" -C "$dir"; rm -f "$tarball"
     version="$(runuser -u "$RUNNER_USER" -- "$dir/bin/Runner.Listener" --version)"
@@ -200,7 +198,7 @@ add_runner() {
 
   if [[ ! -r "$dir/.runner" ]]; then
     token="$(get_registration_token "$REPO_FULL_NAME")"
-    runuser -u "$RUNNER_USER" -- env HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)" "$dir/config.sh" --unattended --url "$REPO_URL" --token "$token" --name "$name" --labels "$CUSTOM_LABELS" --work _work
+    ( cd "$dir" && runuser -u "$RUNNER_USER" -- env HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)" ./config.sh --unattended --url "$REPO_URL" --token "$token" --name "$name" --labels "$CUSTOM_LABELS" --work _work )
     unset token
     write_install_state "$dir" registered "$name" "$version"
   else
@@ -208,9 +206,9 @@ add_runner() {
     success "Runner already registered locally: $name"
   fi
 
-  if [[ ! -r "$dir/.service" ]]; then (cd "$dir" && ./svc.sh install "$RUNNER_USER"); fi
+  # Never execute runner-writable svc.sh as root.
   service="$(configure_runner_service_environment "$dir" "$RUNNER_USER" "$ROOTLESS_DOCKER")"
-  (cd "$dir" && ./svc.sh start)
+  systemctl enable --now "$service"
   sleep 2; systemctl is-active --quiet "$service" || die "Runner service failed to start: $service"
   uid="$(id -u "$RUNNER_USER")"; home="$(getent passwd "$RUNNER_USER" | cut -d: -f6)"
   if [[ "$ROOTLESS_DOCKER" == "true" ]]; then

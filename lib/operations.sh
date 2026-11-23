@@ -30,7 +30,8 @@ list_all() {
   local file base dir service status
   shopt -s nullglob
   for file in "$PROJECTS_DIR"/*.json; do
-    base="$(jq -r .base_dir "$file")"
+    load_project "$(jq -r .slug "$file")"
+    base="$BASE_DIR"
     while IFS= read -r dir; do
       service="$(runner_service_from_dir "$dir")"; status="$(systemctl is-active "$service" 2>/dev/null || true)"
       printf '  %-10s %-60s %s\n' "$status" "$(runner_name_from_dir "$dir")" "$dir"
@@ -52,7 +53,8 @@ doctor() {
   shopt -s nullglob
   for file in "$PROJECTS_DIR"/*.json; do
     validate_project_json "$file"; slug="$(jq -r .slug "$file")"; [[ -z "$filter_slug" || "$slug" == "$filter_slug" ]] || continue
-    user="$(jq -r .runner_user "$file")"; base="$(jq -r .base_dir "$file")"; rootless="$(jq -r .rootless_docker "$file")"
+    load_project "$slug"
+    user="$RUNNER_USER"; base="$BASE_DIR"; rootless="$ROOTLESS_DOCKER"
     if (( JSON_OUTPUT == 0 )); then log "[${slug}] repo=$(jq -r .repo_full_name "$file") user=${user}"; fi
     if ! id "$user" >/dev/null 2>&1; then warn "${slug}: missing user ${user}"; ((failures+=1)); continue; fi
     if id -nG "$user" | tr ' ' '\n' | grep -Eq '^(sudo|wheel|docker)$'; then warn "${slug}: runner user belongs to privileged group"; ((failures+=1)); fi
@@ -126,10 +128,10 @@ remove_runner() {
   if [[ -n "$service" ]]; then
     systemctl stop "$service" || true
   fi
-  if [[ -x "$dir/svc.sh" && -r "$dir/.service" ]]; then (cd "$dir" && ./svc.sh uninstall) || true; fi
+  [[ -n "$service" ]] && remove_trusted_runner_service_unit "$dir" "$service"
   if [[ -r "$dir/.runner" ]]; then
     token="$(get_remove_token "$REPO_FULL_NAME")"
-    runuser -u "$RUNNER_USER" -- env HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)" "$dir/config.sh" remove --token "$token"
+    ( cd "$dir" && runuser -u "$RUNNER_USER" -- env HOME="$(getent passwd "$RUNNER_USER" | cut -d: -f6)" ./config.sh remove --token "$token" )
     unset token
   fi
   rm -rf --one-file-system "$dir"
@@ -144,15 +146,17 @@ upgrade_runner_dir() {
   info "Upgrading $(runner_name_from_dir "$dir") from v${current} to v${latest}."
   wait_runner_idle "$dir" 3600; service="$(runner_service_from_dir "$dir")"; state="$(systemctl is-active "$service" 2>/dev/null || true)"
   tmp="$(mktemp -d)"; curl -fL --retry 3 -o "$tmp/$asset" "$url"
-  if [[ "$digest" =~ ^sha256:([a-fA-F0-9]{64})$ ]]; then [[ "$(sha256sum "$tmp/$asset"|awk '{print $1}')" == "${BASH_REMATCH[1]}" ]] || die "Runner digest mismatch."; fi
+  [[ "$digest" =~ ^sha256:([a-fA-F0-9]{64})$ ]] || die "Runner release has no verified SHA-256 digest."
+  [[ "$(sha256sum "$tmp/$asset"|awk '{print $1}')" == "${BASH_REMATCH[1]}" ]] || die "Runner digest mismatch."
   tar -xzf "$tmp/$asset" -C "$tmp"
   rm -f "$tmp/$asset"
   [[ -n "$service" ]] && systemctl stop "$service"
-  rsync -a --delete \
+  # The target directory belongs to the runner; perform updates without root privileges.
+  chmod -R a+rX "$tmp"
+  runuser -u "$user" -- rsync -a --delete \
     --exclude '.runner' --exclude '.credentials' --exclude '.credentials_rsaparams' --exclude '.service' \
     --exclude '.ghrctl-install.json' --exclude '_work/' --exclude '_diag/' --exclude '.env' \
     "$tmp/" "$dir/"
-  chown -R "$user:$user" "$dir"
   [[ "$state" == "active" ]] && systemctl start "$service"
   rm -rf "$tmp"
   [[ "$(runuser -u "$user" -- "$dir/bin/Runner.Listener" --version)" == "$latest" ]] || die "Runner upgrade verification failed."
