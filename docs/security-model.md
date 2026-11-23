@@ -81,3 +81,12 @@ The beta does not automatically:
 - manage organization/enterprise or ephemeral JIT runners.
 
 Operators remain responsible for host patching, network exposure, repository access control, workflow review, secret scoping, monitoring, and incident response.
+
+## Root privilege boundary (hardening)
+
+Privileged maintenance never executes `svc.sh` from runner-writable storage, and
+never writes runner-local binaries, symlinks, or state as root. New systemd unit
+files are root-owned and launch `runsvc.sh` with `User=<runner-user>`.
+Legacy units are accepted only with verified root-owned service metadata.
+The rootless Docker socket is repository-scoped, not a root daemon escape hatch.
+Always inspect service identity before changing an existing runner host.

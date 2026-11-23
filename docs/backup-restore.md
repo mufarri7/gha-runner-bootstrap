@@ -91,3 +91,11 @@ A managed-host backup is not a full disaster-recovery image. Independently back 
 6. Remove old GitHub runner registrations and securely decommission the old host only after acceptance.
 
 Do not copy runner installation directories between hosts as a migration shortcut; they contain runtime credentials and machine-specific service state.
+
+## Security limits for importing archives
+
+Archives are capped to 128 MiB when decompressed, checked before extraction, and
+their migration manifest is validated before creating users or installing packages.
+Only distinct repository-boundary entries are accepted, with non-root users,
+bounded runner counts and paths under `GHRCTL_BASE_ROOT`. Symlinked or external
+runner paths must be reconstructed manually under operator control.

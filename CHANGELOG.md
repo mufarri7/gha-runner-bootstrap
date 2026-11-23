@@ -36,3 +36,14 @@ First reviewable public beta.
 - Supported hosts are Ubuntu/Debian systems using `apt` and systemd.
 - Supported runners are persistent GitHub.com repository-level runners.
 - Organization/enterprise runner groups and JIT/ephemeral workers remain roadmap items.
+
+## Unreleased — persistent-runner trust-boundary hardening
+
+- Use trusted root-owned systemd units and verify legacy unit metadata rather than
+  running the user-writable runner service installer as root.
+- Prevent privileged writes into runner-controlled tool and binary directories.
+- Correct CRLF registration-token handling and interrupted first registration.
+- Remove automatic runner-service restarts during project-tool installation.
+- Validate restore manifests before privileged host operations; cap archive expansion.
+- Add regression coverage for manifest injection, legacy-service spoofing, and
+  root/non-root validation.

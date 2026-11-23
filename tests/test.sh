@@ -80,10 +80,30 @@ mkdir -p "$GHRCTL_BASE_ROOT/fixture/actions-runner-02"
 printf 'sshd.service\n' > "$GHRCTL_BASE_ROOT/fixture/actions-runner-02/.service"
 if (runner_service_from_dir "$GHRCTL_BASE_ROOT/fixture/actions-runner-02" >/dev/null 2>&1); then fail "forged .service accepted"; fi
 
+# A legitimate pre-existing GitHub service is managed only with matching User,
+# WorkingDirectory and ExecStart. Fail closed if any metadata is different.
+legacy_dir="$GHRCTL_BASE_ROOT/fixture/actions-runner-03"
+legacy="actions.runner.owner.repo.gha-fixture.service"
+mkdir -p "$legacy_dir"
+printf '%s\n' "$legacy" > "$legacy_dir/.service"
+touch "$GHRCTL_UNIT_DIR/$legacy"
+cat > "$TMP/mockbin/systemctl" <<'SH_SYSTEMCTL'
+#!/usr/bin/env bash
+case "${3:-}" in
+  --property=User) printf '%s\n' "${TEST_SERVICE_USER:-gha-fixture}" ;;
+  --property=WorkingDirectory) printf '%s\n' "$TEST_RUNNER_DIR" ;;
+  --property=ExecStart) printf '{ path=%s/runsvc.sh ; argv[]=%s/runsvc.sh ; }\n' "$TEST_RUNNER_DIR" "$TEST_RUNNER_DIR" ;;
+esac
+SH_SYSTEMCTL
+chmod +x "$TMP/mockbin/systemctl"
+export TEST_RUNNER_DIR="$legacy_dir"
+assert_eq "$(PATH="$TMP/mockbin:$PATH" runner_service_from_dir "$legacy_dir")" "$legacy"
+if (TEST_SERVICE_USER=other PATH="$TMP/mockbin:$PATH" runner_service_from_dir "$legacy_dir" >/dev/null 2>&1); then fail "mismatched legacy unit accepted"; fi
+
 secret=''
 secret_value="$(printf 'token-value\r\n' | (prompt_secret secret 'test'; printf '%s' "$secret"))"
 assert_eq "$secret_value" "token-value"
-rm -rf -- "$GHRCTL_BASE_ROOT/fixture/actions-runner-01" "$GHRCTL_BASE_ROOT/fixture/actions-runner-02"
+rm -rf -- "$GHRCTL_BASE_ROOT/fixture/actions-runner-01" "$GHRCTL_BASE_ROOT/fixture/actions-runner-02" "$GHRCTL_BASE_ROOT/fixture/actions-runner-03"
 
 BACKUP="$TMP/fixture.tar.zst"
 create_backup_archive project fixture "$BACKUP" >/dev/null

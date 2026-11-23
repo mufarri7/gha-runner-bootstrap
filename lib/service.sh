@@ -25,6 +25,9 @@ trusted_runner_unit_file() {
   file="$(ghrctl_unit_dir)/$name"
   [[ -f "$file" && ! -L "$file" && "$(stat -c %u "$file")" == "0" ]] ||
     die "Runner unit must be a root-owned regular file: $file"
+  local mode
+  mode="$(stat -c %a "$file")"
+  (( (8#$mode & 8#022) == 0 )) || die "Runner unit is group/world writable: $file"
   printf '%s' "$file"
 }
 

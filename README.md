@@ -249,3 +249,28 @@ Repository CI downloads pinned, checksum-verified ShellCheck and actionlint bina
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Security-hardening upgrade note
+
+The managed service boundary uses root-owned systemd units named `ghrctl-<slug>-<index>.service`.
+The privileged manager never executes `svc.sh` supplied by an unprivileged runner.
+Older GitHub-created `actions.runner.*.service` units remain usable **only** when their
+root-owned unit file has the expected `User`, `WorkingDirectory`, and `ExecStart`.
+An unexpected or edited `.service` pointer fails closed.
+
+For an existing host (including a host with an active RedeemAPI runner), first inspect
+the new source and run **read-only** `sudo ./ghrctl list` and
+`sudo ./ghrctl doctor redeemapi`. Do not run `repair`, `upgrade`, or `drain`
+if validation reports a mismatch; inspect `systemctl cat <service>` first.
+A GitHub repository update alone does not restart or upgrade an installed host.
+
+Tool installations now avoid restarting runner services while jobs are in flight.
+Persistent runners remain untrusted between jobs; do not route arbitrary fork PRs to them.
+For multi-repository migration, create a distinct `ghrctl add-project` per repository
+with its own restricted OS user and Rootless Docker daemon.
+
+Restores only accept schema-v2 manifests with up to 64 distinct projects and up to
+16 runners per project, restricted to directories underneath the configured CI root.
+Archive decompression is capped at 128 MiB. An external directory or symlink must be
+migrated manually after a separate operator security review, not by importing a
+privileged manifest.
