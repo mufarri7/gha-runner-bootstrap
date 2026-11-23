@@ -20,6 +20,8 @@ source "${GHRCTL_ROOT}/lib/service.sh"
 source "${GHRCTL_ROOT}/lib/runner.sh"
 # shellcheck source=lib/operations.sh
 source "${GHRCTL_ROOT}/lib/operations.sh"
+# shellcheck source=lib/validation.sh
+source "${GHRCTL_ROOT}/lib/validation.sh"
 # shellcheck source=lib/backup.sh
 source "${GHRCTL_ROOT}/lib/backup.sh"
 # shellcheck source=lib/cli.sh

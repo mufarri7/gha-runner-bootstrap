@@ -65,7 +65,7 @@ create_backup_archive() {
   need_root
   init_dirs
   have zstd || die "zstd is required. Run bootstrap-host."
-  [[ "$kind" == "project" || "$kind" == "server" ]] || die "Backup kind must be project or server."
+  [[ "$kind" == "project" || "$kind" == "host" ]] || die "Backup kind must be project or host."
   mkdir -p "$(dirname "$destination")"
   work="$(mktemp -d "${BACKUP_WORK_DIR}/backup.XXXXXX")"
   mkdir -p "$work/payload/projects" "$work/payload/profiles" "$work/payload/inventory"
@@ -207,15 +207,17 @@ validate_backup_archive() {
   [[ -r "$archive" ]] || die "Backup not found: $archive"
   mkdir -p "$work/extract"
   tar_file="$work/archive.tar"
-  zstd -dc "$archive" >"$tar_file"
+  if ! (set -o pipefail; zstd -dc "$archive" | head -c $((128 * 1024 * 1024 + 1)) >"$tar_file"); then
+    die "Backup decompression failed or exceeded safety bounds."
+  fi
+  (( $(stat -c %s "$tar_file") <= 128 * 1024 * 1024 )) || die "Backup tar exceeds 128 MiB."
   validate_backup_tar "$tar_file" || die "Backup archive structure validation failed."
   tar -xf "$tar_file" -C "$work/extract" --no-same-owner --no-same-permissions --delay-directory-restore
   verify_extracted_backup_checksums "$work/extract" || die "Backup checksum validation failed."
   jq -e --argjson schema "$BACKUP_SCHEMA_VERSION" \
-    '.schema_version==$schema and .secret_free==true and (.kind=="project" or .kind=="server")' \
+    '.schema_version==$schema and .secret_free==true and (.kind=="project" or .kind=="host")' \
     "$work/extract/backup.json" >/dev/null || die "Unsupported or unsafe backup metadata."
-  jq -e '.schema_version==2 and .secret_free==true and (.projects|type=="array")' \
-    "$work/extract/manifest.json" >/dev/null || die "Unsupported or unsafe migration manifest."
+  validate_restore_manifest "$work/extract/manifest.json" || die "Unsafe migration manifest."
   if find "$work/extract" -type f \( -name '.credentials*' -o -name '.runner' -o -name '*.token' \) | grep -q .; then
     die "Backup contains forbidden credential material."
   fi
@@ -250,7 +252,7 @@ restore_manifest() {
   os_check
   local manifest="${1:-}" slug repo repo_full user base labels rootless count scan_ref project existing missing index
   [[ -r "$manifest" ]] || die "Manifest file not found: $manifest"
-  jq -e '(.schema_version==2) and (.projects|type=="array") and (.secret_free==true)' "$manifest" >/dev/null || die "Unsupported manifest."
+  validate_restore_manifest "$manifest" || die "Unsafe restore manifest."
   install_base_packages
   install_docker_packages
   ensure_swap_auto
@@ -276,7 +278,7 @@ restore_manifest() {
       save_project "$slug" "$repo" "$repo_full" "$user" "$base" "$labels" "$rootless" "$scan_ref"
     else
       load_project "$slug"
-      [[ "$REPO_FULL_NAME" == "$repo_full" && "$RUNNER_USER" == "$user" && "$BASE_DIR" == "$base" ]] \
+      [[ "$REPO_FULL_NAME" == "$repo_full" && "$RUNNER_USER" == "$user" && "$BASE_DIR" == "$base" && "$ROOTLESS_DOCKER" == "$rootless" ]] \
         || die "Existing project '$slug' conflicts with the restore manifest."
     fi
 
