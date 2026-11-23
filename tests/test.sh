@@ -83,6 +83,7 @@ if (runner_service_from_dir "$GHRCTL_BASE_ROOT/fixture/actions-runner-02" >/dev/
 secret=''
 secret_value="$(printf 'token-value\r\n' | (prompt_secret secret 'test'; printf '%s' "$secret"))"
 assert_eq "$secret_value" "token-value"
+rm -rf -- "$GHRCTL_BASE_ROOT/fixture/actions-runner-01" "$GHRCTL_BASE_ROOT/fixture/actions-runner-02"
 
 BACKUP="$TMP/fixture.tar.zst"
 create_backup_archive project fixture "$BACKUP" >/dev/null
