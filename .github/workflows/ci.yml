@@ -80,7 +80,9 @@ jobs:
         run: |
           set -euo pipefail
           test_home="$(mktemp -d)"
-          sudo chown nobody:nogroup "${test_home}"
+          # GitHub workspaces may not be traversable by nobody. Stage a small fixture copy.
+          cp -a ghrctl lib tests "${test_home}/"
+          sudo chown -R nobody:nogroup "${test_home}"
           sudo -u nobody env \
             HOME="${test_home}" \
             GHRCTL_STATE_DIR="${test_home}/state" \
@@ -90,6 +92,7 @@ jobs:
             GHRCTL_BASE_ROOT="${test_home}/runners" \
             bash -c '
               set -Eeuo pipefail
+              cd "$HOME"
               source ./ghrctl
               test "$(sanitize_slug "My Project")" = "my-project"
               test "$(recommend_swap_mib 8192 50000 100000)" = "4096"
