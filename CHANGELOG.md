@@ -47,3 +47,11 @@ First reviewable public beta.
 - Validate restore manifests before privileged host operations; cap archive expansion.
 - Add regression coverage for manifest injection, legacy-service spoofing, and
   root/non-root validation.
+
+## Unreleased — managed runner service bootstrap
+
+- Prepare the top-level `runsvc.sh` from the unpacked upstream launcher under
+  the restricted runner UID on fresh installs and incomplete registrations.
+- Recreate the launcher after manual runner upgrades and preserve `.path`.
+- Test fresh launcher creation, existing-unit recovery and rejection of unsafe
+  or missing launchers. Document root-owned legacy unit permission normalization.

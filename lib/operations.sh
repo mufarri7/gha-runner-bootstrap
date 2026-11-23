@@ -155,8 +155,11 @@ upgrade_runner_dir() {
   chmod -R a+rX "$tmp"
   runuser -u "$user" -- rsync -a --delete \
     --exclude '.runner' --exclude '.credentials' --exclude '.credentials_rsaparams' --exclude '.service' \
-    --exclude '.ghrctl-install.json' --exclude '_work/' --exclude '_diag/' --exclude '.env' \
+    --exclude '.ghrctl-install.json' --exclude '_work/' --exclude '_diag/' --exclude '.env' --exclude '.path' \
     "$tmp/" "$dir/"
+  # rsync --delete removes the generated top-level runsvc.sh.
+  # Recreate it as the runner user before starting the service.
+  prepare_runner_service_script "$dir" "$user"
   [[ "$state" == "active" ]] && systemctl start "$service"
   rm -rf "$tmp"
   [[ "$(runuser -u "$user" -- "$dir/bin/Runner.Listener" --version)" == "$latest" ]] || die "Runner upgrade verification failed."

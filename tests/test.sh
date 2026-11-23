@@ -82,15 +82,36 @@ done
 
 load_project fixture
 assert_eq "$(runner_service_name_for_dir "$GHRCTL_BASE_ROOT/fixture/actions-runner-01")" "ghrctl-fixture-01.service"
-mkdir -p "$GHRCTL_BASE_ROOT/fixture/actions-runner-01"
+# Reproduce a real freshly unpacked runner: only bin/runsvc.sh exists.
+# Use the real unprivileged nobody account, not a runuser mock.
+service_runner_dir="$GHRCTL_BASE_ROOT/fixture/actions-runner-01"
+mkdir -p "$service_runner_dir/bin"
+printf '#!/bin/sh\nexit 0\n' > "$service_runner_dir/bin/runsvc.sh"
+chmod 755 "$service_runner_dir/bin/runsvc.sh"
+chown -R nobody:nogroup "$service_runner_dir"
+chmod 711 "$TMP" "$TMP/srv" "$GHRCTL_BASE_ROOT/fixture"
 GHRCTL_UNIT_DIR="$TMP/systemd"; export GHRCTL_UNIT_DIR
 mkdir -p "$GHRCTL_UNIT_DIR" "$TMP/mockbin"
 printf '#!/bin/sh\nexit 0\n' > "$TMP/mockbin/systemctl"
 chmod +x "$TMP/mockbin/systemctl"
-service="$(PATH="$TMP/mockbin:$PATH" ensure_runner_service "$GHRCTL_BASE_ROOT/fixture/actions-runner-01" "gha-fixture")"
+service="$(RUNNER_USER=nobody PATH="$TMP/mockbin:$PATH" ensure_runner_service "$service_runner_dir" nobody)"
 assert_eq "$service" "ghrctl-fixture-01.service"
-grep -qx 'User=gha-fixture' "$GHRCTL_UNIT_DIR/$service" || fail "runner user not pinned in managed unit"
-grep -qx "ExecStart=$GHRCTL_BASE_ROOT/fixture/actions-runner-01/runsvc.sh" "$GHRCTL_UNIT_DIR/$service" || fail "managed unit has wrong ExecStart"
+grep -qx 'User=nobody' "$GHRCTL_UNIT_DIR/$service" || fail "runner user not pinned in managed unit"
+grep -qx "ExecStart=$service_runner_dir/runsvc.sh" "$GHRCTL_UNIT_DIR/$service" || fail "managed unit has wrong ExecStart"
+[[ -x "$service_runner_dir/runsvc.sh" ]] || fail "fresh runner launcher was not created"
+assert_eq "$(stat -c %U "$service_runner_dir/runsvc.sh")" nobody
+cmp "$service_runner_dir/bin/runsvc.sh" "$service_runner_dir/runsvc.sh" || fail "runner launcher differs from upstream"
+# The exact incident: registered runner and existing unit, but missing launcher.
+runuser -u nobody -- rm -- "$service_runner_dir/runsvc.sh"
+assert_eq "$(RUNNER_USER=nobody PATH="$TMP/mockbin:$PATH" ensure_runner_service "$service_runner_dir" nobody)" "$service"
+[[ -x "$service_runner_dir/runsvc.sh" ]] || fail "existing runner launcher was not repaired"
+# Do not overwrite an unexpected symlink or create an unsafe launcher.
+runuser -u nobody -- rm -- "$service_runner_dir/runsvc.sh"
+runuser -u nobody -- ln -s /etc/passwd "$service_runner_dir/runsvc.sh"
+if (RUNNER_USER=nobody PATH="$TMP/mockbin:$PATH" ensure_runner_service "$service_runner_dir" nobody >/dev/null 2>&1); then fail "symlink launcher accepted"; fi
+runuser -u nobody -- rm -- "$service_runner_dir/runsvc.sh" "$service_runner_dir/bin/runsvc.sh"
+if (RUNNER_USER=nobody PATH="$TMP/mockbin:$PATH" ensure_runner_service "$service_runner_dir" nobody >/dev/null 2>&1); then fail "missing upstream launcher accepted"; fi
+chmod 700 "$TMP"
 
 # A runner-writable legacy .service file must never select an unrelated systemd service.
 mkdir -p "$GHRCTL_BASE_ROOT/fixture/actions-runner-02"
