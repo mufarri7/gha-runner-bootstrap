@@ -19,7 +19,7 @@ env:
   ACTIONLINT_ARCHIVE_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
 
 jobs:
-  validate:
+  shell:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
