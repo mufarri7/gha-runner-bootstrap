@@ -52,6 +52,8 @@ assert_jq "$MAZAYA_PROFILE" 'any(.setup_actions[]; .action=="shivammathur/setup-
 assert_jq "$MAZAYA_PROFILE" '.docker_required == true'
 assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("mysql:8.0")) != null'
 assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("mysql:8.0.46")) != null'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("python:3.12")) != null'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("fixture/backend:ci")) != null'
 assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("mysql:host")) == null'
 assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("pgsql:host")) == null'
 assert_jq "$MAZAYA_PROFILE" 'any(.notes[]; contains("no-sudo"))'

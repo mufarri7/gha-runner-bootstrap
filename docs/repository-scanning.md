@@ -80,7 +80,7 @@ manual-review items. It never runs setup-php or adds sudo access to runner users
 operator-provisioned PHP or a reviewed containerized job may be required.
 
 Docker image references are read only from explicit Dockerfile FROM statements,
-workflow/container/Compose \`image:\` fields, recognized Testcontainers constructors,
+workflow/container/Compose \`image:\` fields, recognized Testcontainers constructors, scalar workflow `container:` values,
 and literal \`docker run\`/\`docker pull\` invocations. Arbitrary PHP DSNs and URL
 schemes are not interpreted as container images (e.g. \`mysql:host\`).
 Extraction remains bounded, static-only and intentionally heuristic: complex

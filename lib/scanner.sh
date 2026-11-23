@@ -156,6 +156,7 @@ def add_image(value):
     images.add(value)
 
 compose_names={'docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml'}
+flag_no_values={'--rm','--detach','-d','-i','-t','-it','-ti','--init','--read-only'}
 flag_values={
     '-e','--env','-p','--publish','--name','--network','--volume','-v','--user','-u',
     '--workdir','-w','--label','--add-host','--restart','--health-cmd','--platform',
@@ -166,14 +167,26 @@ for rel,src in texts:
     if rel.startswith('.github/workflows/') or basename in compose_names:
         for match_image in re.finditer(r'(?m)^\s*(?:-\s*)?image:\s*["\']?([A-Za-z0-9][A-Za-z0-9._/:@-]*)',src):
             add_image(match_image.group(1))
+        if rel.startswith('.github/workflows/'):
+            for scalar in re.finditer(r'(?m)^\s*container:\s*["\']?([A-Za-z0-9][A-Za-z0-9._/:@-]*)',src):
+                add_image(scalar.group(1))
     if basename=='dockerfile' or basename.startswith('dockerfile.'):
         for match_image in re.finditer(r'(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)',src):
             add_image(match_image.group(1))
 
-    # Handle explicit docker run/pull commands with known flag/value pairs.
-    for command in re.finditer(r'\bdocker\s+(?:run|pull)\s+([^\n\r]+)',src.replace('\\\n',' ')):
-        try: args=shlex.split(command.group(1),posix=True)
+    # Parse only explicit CLI image arguments; unknown flags fail closed.
+    for command in re.finditer(r'\bdocker\s+(run|pull|build)\s+([^\n\r]+)',src.replace('\\\n',' ')):
+        action,raw_args=command.group(1),command.group(2)
+        try: args=shlex.split(raw_args,posix=True)
         except ValueError: continue
+        if action=='build':
+            for index,arg in enumerate(args):
+                if arg in ('-t','--tag') and index+1<len(args): add_image(args[index+1])
+                elif arg.startswith('--tag='): add_image(arg.split('=',1)[1])
+            continue
+        if action=='pull':
+            if args and not args[0].startswith('-'): add_image(args[0])
+            continue
         skip=False
         for arg in args:
             if skip:
@@ -182,8 +195,9 @@ for rel,src in texts:
             if arg in flag_values:
                 skip=True
                 continue
-            if arg.startswith('-') or arg in ('\\','|','&&','||'): continue
-            if arg.startswith('$'): break
+            if arg in flag_no_values or any(arg.startswith(k+'=') for k in flag_values if k.startswith('--')):
+                continue
+            if arg.startswith('-') or arg in ('\\','|','&&','||') or arg.startswith('$'): break
             add_image(arg)
             break
 
