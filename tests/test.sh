@@ -80,6 +80,7 @@ mkdir -p "$GHRCTL_BASE_ROOT/fixture/actions-runner-02"
 printf 'sshd.service\n' > "$GHRCTL_BASE_ROOT/fixture/actions-runner-02/.service"
 if (runner_service_from_dir "$GHRCTL_BASE_ROOT/fixture/actions-runner-02" >/dev/null 2>&1); then fail "forged .service accepted"; fi
 
+secret=''
 secret_value="$(printf 'token-value\r\n' | (prompt_secret secret 'test'; printf '%s' "$secret"))"
 assert_eq "$secret_value" "token-value"
 
