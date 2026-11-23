@@ -18,7 +18,7 @@ list_all() {
     tmp="$(mktemp)"; printf '[]' >"$tmp"
     shopt -s nullglob
     for file in "$PROJECTS_DIR"/*.json; do
-      slug="$(jq -r .slug "$file")"; base="$(jq -r .base_dir "$file")"
+      slug="$(jq -r .slug "$file")"; load_project "$slug"; base="$BASE_DIR"
       while IFS= read -r dir; do
         name="$(runner_name_from_dir "$dir")"; service="$(runner_service_from_dir "$dir")"; status="$(systemctl is-active "$service" 2>/dev/null || true)"
         jq --arg slug "$slug" --arg name "$name" --arg dir "$dir" --arg service "$service" --arg status "$status" '. += [{project:$slug,name:$name,directory:$dir,service:$service,status:$status}]' "$tmp" >"${tmp}.new"; mv "${tmp}.new" "$tmp"
