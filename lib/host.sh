@@ -163,8 +163,8 @@ ensure_runner_user() {
   fi
   loginctl enable-linger "$user"
   systemctl start "user@${uid}.service" || true
-  mkdir -p "$home/.config/systemd/user" "$home/.local/bin" "$home/.local/opt"
-  chown -R "$user:$user" "$home/.config" "$home/.local"
+  # A compromised runner controls its home: never chown/follow its symlinks as root.
+  runuser -u "$user" -- mkdir -p -- "$home/.config/systemd/user" "$home/.local/bin" "$home/.local/opt"
 }
 
 user_systemctl() {

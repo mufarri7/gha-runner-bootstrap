@@ -31,6 +31,9 @@ add_project_interactive() {
     scan_repository "$repo_url" "$slug" "$scan_ref"
     apply_tool_profile "$slug"
   fi
+  # A failed initial registration must resume as add-runner, not add-project.
+  mark_operation completed 0 "Project definition saved."
+  ACTIVE_OPERATION_FILE=""
   add_runner "$slug"
 }
 

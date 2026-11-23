@@ -4,7 +4,7 @@
 
 It bootstraps a new CI VPS, creates an isolated trust boundary per repository, registers one or more runners, statically inspects repositories for host prerequisites, manages rootless Docker, and produces secret-free migration backups for one project or the whole managed CI host.
 
-> **Beta status:** `0.2.0-beta.1`. There is intentionally no stable `v1.0` release or GitHub Release yet. The CLI and state schema may change while the beta is tested on clean and existing hosts.
+> **Beta status:** `0.2.0-beta.1`. There is intentionally no stable `v1.0` release, tag, or GitHub Release yet. The CLI and state schema may change while the beta is tested on clean and existing hosts.
 
 ## Architecture
 
@@ -105,7 +105,9 @@ The generated profile can identify, among other things:
 - Docker/Testcontainers usage and public image references;
 - `yq`, `kubectl`, `actionlint`, `kubeconform`, Helm, and Kustomize references.
 
-Automatic host installation is restricted to an explicit apt allowlist. Unknown package names extracted from an untrusted repository are never installed. Project tools are installed under the repository user's `~/.local/bin`, not globally. Tools without a verifiable upstream checksum/digest are rejected rather than installed silently.
+Automatic host installation is restricted to an explicit apt allowlist. Unknown package names extracted from an untrusted repository are never installed. Project tools are installed under the repository user's `~/.local/bin`, not globally. Tools without a verifiable upstream checksum or digest are rejected rather than installed silently.
+
+Repository scanning is heuristic and produces a reviewable plan; it does not guarantee that every custom workflow dependency can be inferred.
 
 ## Dynamic swap policy
 
@@ -146,7 +148,9 @@ sudo ./ghrctl backup-host ./ci-host.tar.zst
 sudo ./ghrctl restore-backup ./ci-host.tar.zst
 ```
 
-Backups are deterministic, checksummed, and intentionally **secret-free**. They include project definitions, runner inventory, static tool profiles, and reconstruction manifests. They exclude:
+Backups are deterministic, checksummed, and intentionally **secret-free**. Before extraction, restore validates archive paths, permitted descriptor locations, member types, member count, and total payload size; symbolic links, hard links, devices, FIFOs, traversal paths, and unexpected files are rejected.
+
+Backups include project definitions, runner inventory, static tool profiles, and reconstruction manifests. They exclude:
 
 - GitHub tokens and PATs;
 - `.credentials`, `.runner`, and registration state;
@@ -154,7 +158,7 @@ Backups are deterministic, checksummed, and intentionally **secret-free**. They 
 - Docker images, layers, volumes, and build cache;
 - repository or environment secrets.
 
-Restore therefore asks for fresh short-lived runner registration credentials. This is a managed-CI reconstruction backup, not a raw VPS disk image or a general `/etc` backup.
+Restore therefore asks for fresh short-lived runner registration credentials. Interrupted restore is resumable: existing matching project state is preserved and only missing runner registrations are requested. This is a managed-CI reconstruction backup, not a raw VPS disk image or a general `/etc` backup.
 
 See [Backup and restore](docs/backup-restore.md).
 
@@ -202,7 +206,7 @@ A runner can be registered using one of three methods:
 
 1. paste the temporary token shown in repository **Settings → Actions → Runners → New self-hosted runner**;
 2. use an already authenticated `gh` CLI session;
-3. enter a one-time GitHub token/PAT with repository `Administration: write`.
+3. enter a one-time GitHub token or PAT with repository `Administration: write`.
 
 Tokens are read interactively and are never stored in project state, logs, manifests, or backups.
 
@@ -224,22 +228,49 @@ See [Security model](docs/security-model.md) and [SECURITY.md](SECURITY.md).
 
 - Ubuntu and Debian with systemd and `apt`.
 - GitHub.com repository-level runners.
-- Persistent runners; organization/enterprise groups and clean JIT/ephemeral workers remain roadmap items.
+- Persistent runners; organization or enterprise groups and clean JIT or ephemeral workers remain roadmap items.
 - Repository scanning is heuristic. Review every generated tool plan before applying it.
 - Host backups rebuild ghrctl-managed CI state; they do not clone the entire operating system.
 - Docker cache backup is excluded because layers can be large and may contain sensitive build material.
-- The script does not create GitHub rulesets, modify workflows, or change repository secrets.
-- No stable self-update channel exists until signed/checksummed GitHub Release assets are published.
+- The script does not create GitHub rulesets, modify target-repository workflows, or change repository secrets.
+- No stable self-update channel exists until signed or checksummed GitHub Release assets are published.
 
 ## Testing
 
 ```bash
-bash -n ghrctl
-sudo ./tests/test.sh
+bash -n ghrctl lib/*.sh tests/test.sh
+shellcheck -x ghrctl lib/*.sh tests/test.sh
+actionlint
+./tests/test.sh
 ```
 
-The functional suite redirects all managed state into temporary directories while exercising the root-gated public entry points. The repository CI also runs ShellCheck.
+Repository CI downloads pinned, checksum-verified ShellCheck and actionlint binaries, validates Bash and workflow syntax, checks JSON examples and repository hygiene, runs functional and non-root inspection tests, and rejects committed GitHub token patterns.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Security-hardening upgrade note
+
+The managed service boundary uses root-owned systemd units named `ghrctl-<slug>-<index>.service`.
+The privileged manager never executes `svc.sh` supplied by an unprivileged runner.
+Older GitHub-created `actions.runner.*.service` units remain usable **only** when their
+root-owned unit file has the expected `User`, `WorkingDirectory`, and `ExecStart`.
+An unexpected or edited `.service` pointer fails closed.
+
+For an existing host (including a host with an active RedeemAPI runner), first inspect
+the new source and run **read-only** `sudo ./ghrctl list` and
+`sudo ./ghrctl doctor redeemapi`. Do not run `repair`, `upgrade`, or `drain`
+if validation reports a mismatch; inspect `systemctl cat <service>` first.
+A GitHub repository update alone does not restart or upgrade an installed host.
+
+Tool installations now avoid restarting runner services while jobs are in flight.
+Persistent runners remain untrusted between jobs; do not route arbitrary fork PRs to them.
+For multi-repository migration, create a distinct `ghrctl add-project` per repository
+with its own restricted OS user and Rootless Docker daemon.
+
+Restores only accept schema-v2 manifests with up to 64 distinct projects and up to
+16 runners per project, restricted to directories underneath the configured CI root.
+Archive decompression is capped at 128 MiB. An external directory or symlink must be
+migrated manually after a separate operator security review, not by importing a
+privileged manifest.

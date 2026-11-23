@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a focused improvement to the public beta.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or operational gap
+      description: Describe the concrete runner-host workflow that is difficult today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include prompts, non-interactive behavior, state changes, and failure handling where relevant.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Primary scope
+      options:
+        - Host bootstrap
+        - Repository analysis/tool plan
+        - Runner lifecycle
+        - Rootless Docker
+        - Backup/restore/migration
+        - Security hardening
+        - CI/testing/documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility considerations
+      description: Explain trust-boundary, credential, rollback, idempotency, and backward-compatibility implications.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Beta boundaries
+      options:
+        - label: This proposal does not require storing GitHub credentials or runner runtime credentials.
+          required: true
+        - label: I understand that persistent public-repository runners have a high trust risk.
+          required: true

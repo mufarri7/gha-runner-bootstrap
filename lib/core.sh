@@ -142,11 +142,13 @@ prompt_secret() {
   local __var="$1" text="$2" value
   (( NON_INTERACTIVE == 0 )) || die "Secrets must be supplied interactively; non-interactive secret input is intentionally unsupported."
   read -r -s -p "$text: " value
-  printf '\n'
+  printf '\n' >&2
+  # Normalize a single CR from CRLF clipboard input, then reject interior newlines.
+  value="${value%$'\r'}"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "Secret input contains a newline."
   [[ -n "$value" ]] || die "A value is required."
   printf -v "$__var" '%s' "$value"
 }
-
 init_dirs() {
   mkdir -p "$PROJECTS_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR" "$LOG_DIR" "$BASE_ROOT" "$(dirname "$LOCK_FILE")" "$(dirname "$LOG_FILE")"
   chmod 700 "$STATE_DIR" "$PROJECTS_DIR" "$DATA_DIR" "$PROFILES_DIR" "$OPERATIONS_DIR" "$BACKUP_WORK_DIR"

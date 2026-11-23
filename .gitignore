@@ -1,7 +1,11 @@
+*.log
+*.tar
+*.tar.gz
 *.tar.zst
 *.zip
-*.log
-*.tmp
 .env
+.env.*
+!.env.example
+.coverage/
+.tmp/
 .DS_Store
-coverage/

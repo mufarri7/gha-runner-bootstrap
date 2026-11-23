@@ -115,9 +115,9 @@ clone_repo_for_scan() {
   local repo_url="$1" ref="${2:-}" dest="$3" repo_full token auth_header
   repo_full="$(repo_owner_name "$repo_url")" || die "Only github.com repository URLs are supported."
   if [[ -n "$ref" ]]; then
-    if git clone --quiet --depth=1 --filter=blob:none --branch "$ref" "$repo_url" "$dest" 2>/dev/null; then return 0; fi
+    if GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git -c credential.helper= clone --quiet --depth=1 --filter=blob:none --branch "$ref" "$repo_url" "$dest" 2>/dev/null; then return 0; fi
   else
-    if git clone --quiet --depth=1 --filter=blob:none "$repo_url" "$dest" 2>/dev/null; then return 0; fi
+    if GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git -c credential.helper= clone --quiet --depth=1 --filter=blob:none "$repo_url" "$dest" 2>/dev/null; then return 0; fi
   fi
   rm -rf "$dest"
   if have gh && gh auth status >/dev/null 2>&1; then
@@ -133,9 +133,9 @@ clone_repo_for_scan() {
   prompt_secret token "One-time GitHub token/PAT with Contents:read"
   auth_header="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
   if [[ -n "$ref" ]]; then
-    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth_header}" git clone --quiet --depth=1 --filter=blob:none --branch "$ref" "$repo_url" "$dest"
+    GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth_header}" git -c credential.helper= clone --quiet --depth=1 --filter=blob:none --branch "$ref" "$repo_url" "$dest"
   else
-    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth_header}" git clone --quiet --depth=1 --filter=blob:none "$repo_url" "$dest"
+    GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth_header}" git -c credential.helper= clone --quiet --depth=1 --filter=blob:none "$repo_url" "$dest"
   fi
   unset token auth_header
 }
@@ -178,10 +178,15 @@ install_project_node() {
   curl -fsSL --retry 3 -o "$tmp/SHASUMS256.txt" "https://nodejs.org/dist/${version}/SHASUMS256.txt"
   expected="$(awk -v f="$filename" '$2==f {print $1}' "$tmp/SHASUMS256.txt")"; actual="$(sha256sum "$tmp/$filename" | awk '{print $1}')"
   [[ -n "$expected" && "$expected" == "$actual" ]] || die "Node.js SHA-256 verification failed."
-  mkdir -p "$home/.local/opt"
-  tar -xJf "$tmp/$filename" -C "$home/.local/opt"
-  for binary in node npm npx corepack; do [[ -e "$base/bin/$binary" ]] && ln -sfn "$base/bin/$binary" "$home/.local/bin/$binary"; done
-  chown -R "$user:$user" "$home/.local"
+  # The runner owns its local install destination. Never unpack there as root.
+  runuser -u "$user" -- mkdir -p -- "$home/.local/opt" "$home/.local/bin"
+  chmod a+rx "$tmp"; chmod a+r "$tmp/$filename"
+  runuser -u "$user" -- tar -xJf "$tmp/$filename" -C "$home/.local/opt"
+  for binary in node npm npx corepack; do
+    if [[ -e "$base/bin/$binary" ]]; then
+      runuser -u "$user" -- ln -sfn -- "$base/bin/$binary" "$home/.local/bin/$binary"
+    fi
+  done
   rm -rf "$tmp"
   success "Installed verified project Node.js ${version} for ${user}."
 }
@@ -231,13 +236,14 @@ project_binary_arch() {
 install_project_tool() {
   local user="$1" name="$2" requested_version="${3:-}" home bin_dir tmp arch version asset
   home="$(getent passwd "$user" | cut -d: -f6)"; bin_dir="$home/.local/bin"
-  mkdir -p "$bin_dir"; chown "$user:$user" "$home/.local" "$bin_dir"
+  runuser -u "$user" -- mkdir -p -- "$bin_dir"
   tmp="$(mktemp -d)"
   case "$name" in
     yq)
       arch="$(project_binary_arch go)"; asset="yq_linux_${arch}"
       version="$(download_verified_github_asset mikefarah/yq "$requested_version" "$asset" "$tmp/yq")"
-      install -m 0755 "$tmp/yq" "$bin_dir/yq"
+      chmod a+rx "$tmp"; chmod a+r "$tmp/yq"
+      runuser -u "$user" -- install -m 0755 "$tmp/yq" "$bin_dir/yq"
       ;;
     actionlint)
       arch="$(project_binary_arch rust)"
@@ -246,13 +252,15 @@ install_project_tool() {
       asset="actionlint_${raw_version}_linux_${arch}.tar.gz"
       version="$(download_verified_github_asset rhysd/actionlint "$raw_version" "$asset" "$tmp/$asset")"
       tar -xzf "$tmp/$asset" -C "$tmp" actionlint
-      install -m 0755 "$tmp/actionlint" "$bin_dir/actionlint"
+      chmod a+rx "$tmp"; chmod a+r "$tmp/actionlint"
+      runuser -u "$user" -- install -m 0755 "$tmp/actionlint" "$bin_dir/actionlint"
       ;;
     kubeconform)
       arch="$(project_binary_arch go)"; asset="kubeconform-linux-${arch}.tar.gz"
       version="$(download_verified_github_asset yannh/kubeconform "$requested_version" "$asset" "$tmp/$asset")"
       tar -xzf "$tmp/$asset" -C "$tmp" kubeconform
-      install -m 0755 "$tmp/kubeconform" "$bin_dir/kubeconform"
+      chmod a+rx "$tmp"; chmod a+r "$tmp/kubeconform"
+      runuser -u "$user" -- install -m 0755 "$tmp/kubeconform" "$bin_dir/kubeconform"
       ;;
     kubectl)
       arch="$(project_binary_arch go)"
@@ -261,7 +269,8 @@ install_project_tool() {
       curl -fsSL --retry 3 -o "$tmp/kubectl" "https://dl.k8s.io/release/v${version}/bin/linux/${arch}/kubectl"
       curl -fsSL --retry 3 -o "$tmp/kubectl.sha256" "https://dl.k8s.io/release/v${version}/bin/linux/${arch}/kubectl.sha256"
       [[ "$(sha256sum "$tmp/kubectl" | awk '{print $1}')" == "$(tr -d '[:space:]' <"$tmp/kubectl.sha256")" ]] || die "kubectl SHA-256 verification failed"
-      install -m 0755 "$tmp/kubectl" "$bin_dir/kubectl"
+      chmod a+rx "$tmp"; chmod a+r "$tmp/kubectl"
+      runuser -u "$user" -- install -m 0755 "$tmp/kubectl" "$bin_dir/kubectl"
       ;;
     *)
       warn "Automatic installation is not yet implemented for project tool '$name'; keep it job-local in the workflow."
@@ -269,13 +278,12 @@ install_project_tool() {
       return 0
       ;;
   esac
-  chown "$user:$user" "$bin_dir/$name"
   rm -rf "$tmp"
   success "Installed verified project-local ${name} ${version} for ${user}."
 }
 
 install_detected_project_tools() {
-  local slug="$1" profile item name version dir service
+  local slug="$1" profile item name version
   load_project "$slug"; profile="$(profile_file "$slug")"
   while IFS= read -r item; do
     name="$(jq -r .name <<<"$item")"; version="$(jq -r '.version // empty' <<<"$item")"
@@ -283,11 +291,7 @@ install_detected_project_tools() {
       if (( DRY_RUN == 1 )); then log "DRY-RUN install ${name}${version:+ ${version}} into $(getent passwd "$RUNNER_USER" | cut -d: -f6)/.local/bin"; else install_project_tool "$RUNNER_USER" "$name" "$version"; fi
     fi
   done < <(jq -c '.project_tools[]?' "$profile")
-  # Normalize PATH for any existing services after tool installation.
-  while IFS= read -r dir; do
-    service="$(configure_runner_service_environment "$dir" "$RUNNER_USER" "$ROOTLESS_DOCKER")"
-    systemctl restart "$service"
-  done < <(runner_dirs "$BASE_DIR")
+  # Runner service PATH already includes ~/.local/bin; no restart or job disruption is needed.
 }
 
 apply_tool_profile() {
