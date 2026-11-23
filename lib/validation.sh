@@ -23,7 +23,7 @@ try:
     for p in projects:
         if not isinstance(p, dict):
             reject("invalid project")
-        slug, repo, full, user, base = [p.get(x) for x in seen]
+        slug, repo, full, user, base = [p.get(x) for x in ("slug", "repo_url", "repo_full_name", "runner_user", "base_dir")]
         if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,62}", slug) or ".." in slug:
             reject("invalid slug")
         match = re.fullmatch(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+)", repo) if isinstance(repo, str) else None
