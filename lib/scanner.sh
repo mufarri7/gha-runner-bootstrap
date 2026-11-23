@@ -38,6 +38,66 @@ def add_ecos(name, manager=None, version=None):
 
 def ev(kind,path,reason): evidence.append({'kind':kind,'path':path,'reason':reason})
 
+
+# Collect static setup-php requirements from workflows, never execute target code.
+php_versions=set()
+for wf_path,wf in texts:
+    if not wf_path.startswith('.github/workflows/') or not wf_path.endswith(('.yml','.yaml')): continue
+    lines=wf.splitlines()
+    for pos,line in enumerate(lines):
+        if not re.match(r'^\s*(?:-\s*)?uses:\s*["\']?shivammathur/setup-php@[\w.-]+',line,re.I): continue
+        indent=len(line)-len(line.lstrip(' '))
+        stop=len(lines)
+        for k in range(pos+1,len(lines)):
+            candidate=lines[k]
+            if re.match(r'^\s*-\s*(?:uses|name|run|id):',candidate) and len(candidate)-len(candidate.lstrip(' '))<=indent:
+                stop=k
+                break
+
+        def setting(key):
+            for k in range(pos+1,stop):
+                found=re.match(r'^\s*'+re.escape(key)+r':\s*(.*?)\s*$',lines[k],re.I)
+                if not found: continue
+                value=found.group(1).strip()
+                if value in ('|','|-','>','>-'):
+                    level=len(lines[k])-len(lines[k].lstrip(' '))
+                    parts=[]
+                    for line2 in lines[k+1:stop]:
+                        if line2.strip() and len(line2)-len(line2.lstrip(' '))<=level: break
+                        if line2.strip(): parts.append(line2.strip())
+                    value=' '.join(parts)
+                value=value.split(' #',1)[0].strip()
+                if len(value)>1 and value[0] in ("'",'"') and value[-1]==value[0]:
+                    value=value[1:-1]
+                return value.strip()
+            return ''
+
+        raw_version=setting('php-version')
+        version=raw_version.lstrip('v') if re.fullmatch(r'v?\d+(?:\.\d+){0,2}',raw_version) else ''
+        if version: php_versions.add(version)
+        elif raw_version: notes.append('Dynamic setup-php version in '+wf_path+' requires manual review.')
+
+        def static_values(value):
+            if not value or '$' in value or '{' in value: return []
+            return [x for x in re.split(r'[\s,]+',value) if re.fullmatch(r'[A-Za-z0-9_.:+-]+',x)]
+
+        extensions=static_values(setting('extensions'))
+        requested_tools=static_values(setting('tools'))
+        info={'action':'shivammathur/setup-php','tool':'php','path':wf_path}
+        if version: info['version']=version
+        if extensions: info['extensions']=extensions
+        if requested_tools: info['tools']=requested_tools
+        if has_path('composer.json') and not any(x.lower().startswith('composer') for x in requested_tools):
+            info['inferred_tools']=['composer']
+        setup.append(info)
+        ev('setup-action',wf_path,'PHP runtime and extensions specified in setup-php')
+
+if php_versions:
+    notes.append('setup-php on a no-sudo self-hosted runner may require operator-provisioned PHP or reviewed containerized CI. Never grant sudo automatically.')
+if len(php_versions)>1:
+    notes.append('Multiple PHP versions detected: '+', '.join(sorted(php_versions)))
+php_version=next(iter(php_versions)) if len(php_versions)==1 else None
+
 if has_path('package.json'):
     manager='npm'
     if has_path('pnpm-lock.yaml'): manager='pnpm'
@@ -54,7 +114,8 @@ if has_path('pyproject.toml','requirements.txt','Pipfile','poetry.lock','uv.lock
 if has_path('go.mod'): add_ecos('go'); ev('ecosystem','go.mod','Go project detected')
 if has_path('Cargo.toml'): add_ecos('rust','cargo'); safe.add('build-essential'); ev('ecosystem','Cargo.toml','Rust project detected')
 if has_path('pom.xml','build.gradle','build.gradle.kts'): add_ecos('java'); ev('ecosystem','pom.xml/build.gradle','Java project detected')
-if has_path('composer.json'): add_ecos('php','composer'); ev('ecosystem','composer.json','PHP project detected')
+if has_path('composer.json'): add_ecos('php','composer',php_version); ev('ecosystem','composer.json','PHP project detected')
+elif php_versions: add_ecos('php',version=php_version)
 if has_path('Gemfile'): add_ecos('ruby','bundler'); ev('ecosystem','Gemfile','Ruby project detected')
 
 for action,key in [('actions/setup-node','node'),('actions/setup-python','python'),('actions/setup-go','go'),('actions/setup-java','java')]:
@@ -85,16 +146,64 @@ for tool,patterns in {
     for item in tools:
         if item['name']==tool and vals: item['version']=sorted(set(vals))[-1]
 
-# Conservative image extraction. Never execute repository code.
-image_patterns=[
- r'(?:DockerImageName\.parse|GenericContainer|fromDockerfile)\(\s*["\']([A-Za-z0-9._/-]+(?::[A-Za-z0-9._-]+)?)',
- r'image:\s*["\']?([A-Za-z0-9._/-]+(?::[A-Za-z0-9._-]+))',
- r'\b(postgres|redis|mysql|mariadb|mongo|rabbitmq|nats|elasticsearch|minio):([0-9A-Za-z._-]+)\b']
-for pat in image_patterns:
-    for m in re.findall(pat,all_text,re.I):
-        if isinstance(m,tuple): images.add(':'.join(m))
-        else: images.add(m)
-images={i for i in images if '/' in i or ':' in i}
+# Only interpret explicitly declared container images, never arbitrary DSN/source strings.
+import shlex
+image_pattern=re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-fA-F]{64})?$')
+def add_image(value):
+    value=value.strip().strip('"').strip("'")
+    if not image_pattern.fullmatch(value) or '://' in value: return
+    if re.search(r':(?:host|port|dbname|charset|user|password)$',value,re.I): return
+    images.add(value)
+
+compose_names={'docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml'}
+flag_no_values={'--rm','--detach','-d','-i','-t','-it','-ti','--init','--read-only'}
+flag_values={
+    '-e','--env','-p','--publish','--name','--network','--volume','-v','--user','-u',
+    '--workdir','-w','--label','--add-host','--restart','--health-cmd','--platform',
+    '--entrypoint','--hostname','-h','--cpus','--memory','--mount','--env-file',
+}
+for rel,src in texts:
+    basename=rel.rsplit('/',1)[-1].lower()
+    if rel.startswith('.github/workflows/') or basename in compose_names:
+        for match_image in re.finditer(r'(?m)^\s*(?:-\s*)?image:\s*["\']?([A-Za-z0-9][A-Za-z0-9._/:@-]*)',src):
+            add_image(match_image.group(1))
+        if rel.startswith('.github/workflows/'):
+            for scalar in re.finditer(r'(?m)^\s*container:\s*["\']?([A-Za-z0-9][A-Za-z0-9._/:@-]*)',src):
+                add_image(scalar.group(1))
+    if basename=='dockerfile' or basename.startswith('dockerfile.'):
+        for match_image in re.finditer(r'(?im)^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)',src):
+            add_image(match_image.group(1))
+
+    # Parse only explicit CLI image arguments; unknown flags fail closed.
+    for command in re.finditer(r'\bdocker\s+(run|pull|build)\s+([^\n\r]+)',src.replace('\\\n',' ')):
+        action,raw_args=command.group(1),command.group(2)
+        try: args=shlex.split(raw_args,posix=True)
+        except ValueError: continue
+        if action=='build':
+            for index,arg in enumerate(args):
+                if arg in ('-t','--tag') and index+1<len(args): add_image(args[index+1])
+                elif arg.startswith('--tag='): add_image(arg.split('=',1)[1])
+            continue
+        if action=='pull':
+            if args and not args[0].startswith('-'): add_image(args[0])
+            continue
+        skip=False
+        for arg in args:
+            if skip:
+                skip=False
+                continue
+            if arg in flag_values:
+                skip=True
+                continue
+            if arg in flag_no_values or any(arg.startswith(k+'=') for k in flag_values if k.startswith('--')):
+                continue
+            if arg.startswith('-') or arg in ('\\','|','&&','||') or arg.startswith('$'): break
+            add_image(arg)
+            break
+
+# High-confidence Testcontainers constructors.
+for found in re.finditer(r'(?:DockerImageName\.parse|(?:new\s+)?GenericContainer)\(\s*["\']([A-Za-z0-9][A-Za-z0-9._/:@-]*)',all_text):
+    add_image(found.group(1))
 
 needs_docker=has_path('Dockerfile','docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml') or match(r'testcontainers|docker/(?:build-push|setup-buildx|login)-action|\bdocker\s+(?:build|run|compose)')
 if needs_docker: notes.append('Rootless Docker is required or strongly indicated by repository files/workflows.')

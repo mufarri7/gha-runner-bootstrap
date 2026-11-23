@@ -41,6 +41,23 @@ assert_jq "$PROFILE" '(.safe_host_packages|index("xvfb")) != null'
 assert_jq "$PROFILE" '(.project_tools|map(.name)|index("yq")) != null'
 assert_jq "$PROFILE" '(.docker_images|index("postgres:15-alpine")) != null'
 
+
+# A PHP/Mazaya-like fixture must not turn PDO DSNs into Docker images.
+MAZAYA_PROFILE="$TMP/mazaya-profile.json"
+static_scan_python | python3 - "$ROOT/tests/fixtures/mazaya-scanner" "owner/mazaya-like" "main" "deadbeef" >"$MAZAYA_PROFILE"
+assert_jq "$MAZAYA_PROFILE" '.static_only == true'
+assert_jq "$MAZAYA_PROFILE" 'any(.ecosystems[]; .name=="php" and .manager=="composer" and .version=="8.3")'
+assert_jq "$MAZAYA_PROFILE" 'any(.ecosystems[]; .name=="node" and .version=="22.12.0")'
+assert_jq "$MAZAYA_PROFILE" 'any(.setup_actions[]; .action=="shivammathur/setup-php" and .version=="8.3" and (.extensions|index("pdo_mysql"))!=null and (.extensions|index("pcntl"))!=null and (.tools|index("composer:v2"))!=null)'
+assert_jq "$MAZAYA_PROFILE" '.docker_required == true'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("mysql:8.0")) != null'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("mysql:8.0.46")) != null'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("python:3.12")) != null'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("fixture/backend:ci")) != null'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("mysql:host")) == null'
+assert_jq "$MAZAYA_PROFILE" '(.docker_images|index("pgsql:host")) == null'
+assert_jq "$MAZAYA_PROFILE" 'any(.notes[]; contains("no-sudo"))'
+
 init_dirs
 save_project "fixture" "https://github.com/owner/repo" "owner/repo" "gha-fixture" "$GHRCTL_BASE_ROOT/fixture" "fixture-ci,shared-ci" false "main"
 mkdir -p "$GHRCTL_BASE_ROOT/fixture"
