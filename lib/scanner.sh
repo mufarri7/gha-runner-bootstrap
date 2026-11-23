@@ -50,8 +50,63 @@ def yaml_scalar(raw):
     return re.split(r'\s+#', val, maxsplit=1)[0].strip()
 
 def step_option(block, key):
-    """Read a literal scalar/list from a setup action's own 'with:' block."""
-    option_re = re.compile(r'(?m)^(\s*)' + re.escape(key) + r':\s*(.*?)\s*
+    """Read a literal value from the 'with:' block of one setup action."""
+    option_re = re.compile(r'(?m)^(\s*)' + re.escape(key) + r':\s*(.*?)\s*$')
+    m = option_re.search(block)
+    if not m:
+        return ''
+    val = yaml_scalar(m.group(2))
+    if val in ('|', '>', '|-', '>-'):
+        indent = len(m.group(1))
+        parts = []
+        for line in block[m.end():].splitlines():
+            if not line.strip():
+                continue
+            if len(line) - len(line.lstrip()) <= indent:
+                break
+            parts.append(line.strip())
+        return ' '.join(parts)
+    return val
+
+def detected_php_setups():
+    results = []
+    uses_re = re.compile(r'(?m)^(\s*)-\s*uses:\s*["\x27]?shivammathur/setup-php@[A-Za-z0-9._-]+["\x27]?\s*(?:#.*)?$', re.I)
+    for path, body in workflow_docs():
+        for m in uses_re.finditer(body):
+            level = len(m.group(1))
+            chosen = []
+            for line in body[m.end():].splitlines(keepends=True):
+                if line.strip() and len(line) - len(line.lstrip()) <= level:
+                    break
+                chosen.append(line)
+            block = ''.join(chosen)
+            version = step_option(block, 'php-version')
+            extensions = step_option(block, 'extensions')
+            tool_names = step_option(block, 'tools')
+            entry = {
+                'action': 'shivammathur/setup-php',
+                'tool': 'php',
+                'path': path,
+                'extensions': sorted(set(t for t in re.split(r'[,\s]+', extensions) if re.fullmatch(r'[A-Za-z0-9_+-]+',t))),
+                'tools': sorted(set(t for t in re.split(r'[,\s]+', tool_names) if re.fullmatch(r'[A-Za-z0-9_.:+-]+',t))),
+            }
+            if re.fullmatch(r'[0-9]+(?:\.[0-9]+){0,2}', version):
+                entry['version'] = version
+            elif version:
+                entry['version_expression'] = version[:128]
+            if has_path('composer.json') and not any(t.split(':')[0] == 'composer' for t in entry['tools']):
+                entry['tools'].append('composer (implied by composer.json)')
+            results.append(entry)
+            ev('setup-action', path, 'shivammathur/setup-php and its literal requirements detected')
+    return results
+
+php_setups = detected_php_setups()
+php_versions = sorted({entry['version'] for entry in php_setups if 'version' in entry},key=lambda version:tuple(int(n) for n in version.split('.')))
+setup.extend(php_setups)
+if php_setups:
+    notes.append('setup-php may require privileged host configuration on a persistent self-hosted runner. Use an operator-provisioned, root-owned PHP runtime or reviewed containerized CI; do not grant runner users sudo.')
+
+if has_path('package.json'):
     manager='npm'
     if has_path('pnpm-lock.yaml'): manager='pnpm'
     elif has_path('yarn.lock'): manager='yarn'
@@ -101,8 +156,7 @@ for tool,patterns in {
         if item['name']==tool and vals: item['version']=sorted(set(vals))[-1]
 
 # Only inspect structured image fields, explicit docker invocations and recognized
-# Testcontainers constructors. Never infer Docker images from arbitrary source text
-# (in particular PDO DSNs such as mysql:host=...).
+# Testcontainers constructors; never infer image tags from PDO DSNs.
 import shlex
 
 def valid_image(value):
@@ -159,14 +213,14 @@ def docker_command_images(line):
         elif token in no_value:
             i += 1
         elif token.startswith('-'):
-            return # unfamiliar flag: do not guess image from following argument
+            return
         else:
             add_image(token)
             return
 
 for path, body in texts:
-    if path.startswith('.github/workflows/') and path.endswith(('.yml','.yaml')) or \
-       path.rsplit('/',1)[-1] in {'docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml'}:
+    if (path.startswith('.github/workflows/') and path.endswith(('.yml','.yaml'))) or \
+       (path.rsplit('/',1)[-1] in {'docker-compose.yml','docker-compose.yaml','compose.yml','compose.yaml'}):
         for line in body.splitlines():
             m = re.match(r'^\s*image:\s*(.+?)\s*$', line)
             if m:
