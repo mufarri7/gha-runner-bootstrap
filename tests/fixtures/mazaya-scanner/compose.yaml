@@ -1,0 +1,5 @@
+services:
+  cache:
+    image: redis:7-alpine
+  database:
+    image: mysql:8.0

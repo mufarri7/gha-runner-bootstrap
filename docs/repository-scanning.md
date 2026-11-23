@@ -70,3 +70,20 @@ Before applying a generated profile, verify:
 5. no workflow assumes Rootful Docker or `/var/run/docker.sock`;
 6. public-repository workflow triggers cannot expose the persistent runner to untrusted code;
 7. custom dependencies not recognized by the scanner are installed through a reviewed, reproducible mechanism.
+
+## PHP workflows and high-confidence Docker image detection
+
+The static scanner recognizes \`shivammathur/setup-php\` steps in workflow YAML
+and reports literal PHP versions, extensions, requested tools (including an
+implied Composer dependency when \`composer.json\` is present), and source paths.
+For persistent self-hosted runners, \`setup-php\` may require privileged host
+setup; prepare the PHP runtime as a root-owned operator action or use a reviewed
+container-based test environment. Do **not** grant a CI runner passwordless sudo
+to satisfy a scanned requirement.
+
+Container image discovery is limited to workflow/Compose \`image:\` fields,
+literal job \`container:\` values, recognized Testcontainers constructors, and
+straightforward \`docker pull/run/create\` or \`docker build -t\` commands.
+An arbitrary occurrence of \`mysql:host\` or another database DSN is not an image.
+This is intentionally conservative: dynamic expressions, complex multiline shell
+commands, and custom actions may require an operator-reviewed plan.
