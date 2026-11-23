@@ -90,3 +90,17 @@ files are root-owned and launch `runsvc.sh` with `User=<runner-user>`.
 Legacy units are accepted only with verified root-owned service metadata.
 The rootless Docker socket is repository-scoped, not a root daemon escape hatch.
 Always inspect service identity before changing an existing runner host.
+
+### Managed launcher and legacy unit permissions
+
+The upstream runner package includes `bin/runsvc.sh`, while its privileged
+`svc.sh install` normally copies it to the runner directory root. ghrctl now
+prepares a missing top-level launcher **as the dedicated runner user** before
+creating or reusing a unit, and after manual binary upgrades. A missing or
+symlinked upstream launcher and an unsafe existing launcher fail closed.
+No privileged invocation of runner-owned `svc.sh` is required.
+
+GitHub's upstream legacy installer uses mode 0664 for systemd units. If the
+root-owned legacy unit's contents, user and working directory have been
+verified, an operator can remove group/other write permissions (mode 0644)
+without restarting the running runner. Do not relax the unit trust check.

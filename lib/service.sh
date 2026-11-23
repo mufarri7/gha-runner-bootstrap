@@ -64,14 +64,39 @@ runner_service_from_dir() {
   return 1
 }
 
+# The upstream runner ships bin/runsvc.sh; its svc.sh install normally copies
+# it to the installation root. Reproduce only that unprivileged operation.
+prepare_runner_service_script() {
+  local dir="$1" user="$2"
+  [[ "$user" == "$RUNNER_USER" && "$(id -u "$user")" != 0 ]] || die "Unsafe runner service user."
+  # All runner-owned path access and writes occur under the runner UID.
+  runuser -u "$user" -- bash -c '
+    set -euo pipefail
+    cd -- "$1"
+    test -f bin/runsvc.sh && test ! -L bin/runsvc.sh || {
+      echo "Missing or unsafe upstream bin/runsvc.sh." >&2; exit 1;
+    }
+    if [[ -e runsvc.sh || -L runsvc.sh ]]; then
+      test -f runsvc.sh && test ! -L runsvc.sh && test -x runsvc.sh || {
+        echo "Unsafe existing runner service launcher." >&2; exit 1;
+      }
+    else
+      install -m 0755 -- bin/runsvc.sh runsvc.sh
+    fi
+  ' bash "$dir" || die "Could not prepare runner service launcher: $dir"
+}
+
 ensure_runner_service() {
   local dir="$1" user="$2" service unit_file tmp unit_dir
-  if service="$(runner_service_from_dir "$dir")"; then
-    printf '%s' "$service"; return 0
-  fi
   [[ "$user" == "$RUNNER_USER" ]] || die "Runner user mismatch."
   [[ "$dir" =~ ^/[A-Za-z0-9_./-]+$ && "$dir" != *..* && "$dir" != *//* ]] ||
     die "Unsafe runner directory for systemd."
+  runner_service_name_for_dir "$dir" >/dev/null
+  if service="$(runner_service_from_dir "$dir")"; then
+    prepare_runner_service_script "$dir" "$user"
+    printf '%s' "$service"; return 0
+  fi
+  prepare_runner_service_script "$dir" "$user"
   unit_dir="$(ghrctl_unit_dir)"
   [[ -d "$unit_dir" && ! -L "$unit_dir" ]] || die "Invalid systemd unit directory."
   service="$(runner_service_name_for_dir "$dir")"
