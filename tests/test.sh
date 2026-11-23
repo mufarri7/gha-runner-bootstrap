@@ -103,6 +103,30 @@ if (TEST_SERVICE_USER=other PATH="$TMP/mockbin:$PATH" runner_service_from_dir "$
 secret=''
 secret_value="$(printf 'token-value\r\n' | (prompt_secret secret 'test'; printf '%s' "$secret"))"
 assert_eq "$secret_value" "token-value"
+
+# Private-repo clone probes must never invoke Git's interactive credential prompt.
+mkdir -p "$TMP/mock-scan-bin"
+cat > "$TMP/mock-scan-bin/git" <<'SH_FAKE_GIT'
+#!/usr/bin/env bash
+printf '%s|%s\n' "${GIT_TERMINAL_PROMPT:-unset}" "${GIT_CONFIG_COUNT:-0}" >>"$GHRCTL_PROBE_LOG"
+[[ "${GIT_TERMINAL_PROMPT:-}" == 0 ]] || exit 88
+if [[ "${GIT_CONFIG_COUNT:-0}" == 1 ]]; then
+  for arg in "$@"; do destination="$arg"; done
+  mkdir -p "$destination"
+  exit 0
+fi
+exit 1
+SH_FAKE_GIT
+chmod +x "$TMP/mock-scan-bin/git"
+export GHRCTL_PROBE_LOG="$TMP/clone-probe.log"
+(
+  have() { return 1; } # simulate an absent gh CLI
+  prompt_secret() { printf -v "$1" '%s' 'throwaway-fixture-token'; }
+  PATH="$TMP/mock-scan-bin:$PATH"
+  clone_repo_for_scan 'https://github.com/owner/private-repo' '' "$TMP/clone-fixture" >/dev/null
+)
+grep -qx '0|0' "$GHRCTL_PROBE_LOG" || fail "anonymous Git probe was interactive"
+grep -qx '0|1' "$GHRCTL_PROBE_LOG" || fail "authenticated Git probe was interactive"
 rm -rf -- "$GHRCTL_BASE_ROOT/fixture/actions-runner-01" "$GHRCTL_BASE_ROOT/fixture/actions-runner-02" "$GHRCTL_BASE_ROOT/fixture/actions-runner-03"
 
 BACKUP="$TMP/fixture.tar.zst"
