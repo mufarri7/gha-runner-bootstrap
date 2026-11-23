@@ -248,11 +248,11 @@ restore_backup_archive() {
 
 restore_manifest() {
   need_root
-  acquire_lock
-  os_check
   local manifest="${1:-}" slug repo repo_full user base labels rootless count scan_ref project existing missing index
   [[ -r "$manifest" ]] || die "Manifest file not found: $manifest"
   validate_restore_manifest "$manifest" || die "Unsafe restore manifest."
+  acquire_lock
+  os_check
   install_base_packages
   install_docker_packages
   ensure_swap_auto

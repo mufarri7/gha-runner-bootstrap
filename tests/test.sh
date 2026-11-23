@@ -42,13 +42,46 @@ assert_jq "$PROFILE" '(.project_tools|map(.name)|index("yq")) != null'
 assert_jq "$PROFILE" '(.docker_images|index("postgres:15-alpine")) != null'
 
 init_dirs
-save_project "fixture" "https://github.com/owner/repo" "owner/repo" "root" "$GHRCTL_BASE_ROOT/fixture" "fixture-ci,shared-ci" false "main"
+save_project "fixture" "https://github.com/owner/repo" "owner/repo" "gha-fixture" "$GHRCTL_BASE_ROOT/fixture" "fixture-ci,shared-ci" false "main"
 mkdir -p "$GHRCTL_BASE_ROOT/fixture"
 MANIFEST="$TMP/manifest.json"
 export_manifest fixture >"$MANIFEST"
 assert_jq "$MANIFEST" '.schema_version == 2 and .secret_free == true'
 assert_jq "$MANIFEST" '.projects|length == 1'
 assert_jq "$MANIFEST" '.projects[0].runner_count == 0'
+validate_restore_manifest "$MANIFEST" || fail "valid manifest rejected"
+
+# A forged manifest must be rejected before any privileged host installation.
+for kind in escape excessive root-user duplicate; do
+  bad="$TMP/manifest-${kind}.json"
+  case "$kind" in
+    escape) jq '.projects[0].base_dir="/etc/systemd/system"' "$MANIFEST" >"$bad" ;;
+    excessive) jq '.projects[0].runner_count=1000' "$MANIFEST" >"$bad" ;;
+    root-user) jq '.projects[0].runner_user="root"' "$MANIFEST" >"$bad" ;;
+    duplicate) jq '.projects += [.projects[0]]' "$MANIFEST" >"$bad" ;;
+  esac
+  if (validate_restore_manifest "$bad" >/dev/null 2>&1); then fail "unsafe manifest accepted: $kind"; fi
+done
+
+load_project fixture
+assert_eq "$(runner_service_name_for_dir "$GHRCTL_BASE_ROOT/fixture/actions-runner-01")" "ghrctl-fixture-01.service"
+mkdir -p "$GHRCTL_BASE_ROOT/fixture/actions-runner-01"
+GHRCTL_UNIT_DIR="$TMP/systemd"; export GHRCTL_UNIT_DIR
+mkdir -p "$GHRCTL_UNIT_DIR" "$TMP/mockbin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/mockbin/systemctl"
+chmod +x "$TMP/mockbin/systemctl"
+service="$(PATH="$TMP/mockbin:$PATH" ensure_runner_service "$GHRCTL_BASE_ROOT/fixture/actions-runner-01" "gha-fixture")"
+assert_eq "$service" "ghrctl-fixture-01.service"
+grep -qx 'User=gha-fixture' "$GHRCTL_UNIT_DIR/$service" || fail "runner user not pinned in managed unit"
+grep -qx "ExecStart=$GHRCTL_BASE_ROOT/fixture/actions-runner-01/runsvc.sh" "$GHRCTL_UNIT_DIR/$service" || fail "managed unit has wrong ExecStart"
+
+# A runner-writable legacy .service file must never select an unrelated systemd service.
+mkdir -p "$GHRCTL_BASE_ROOT/fixture/actions-runner-02"
+printf 'sshd.service\n' > "$GHRCTL_BASE_ROOT/fixture/actions-runner-02/.service"
+if (runner_service_from_dir "$GHRCTL_BASE_ROOT/fixture/actions-runner-02" >/dev/null 2>&1); then fail "forged .service accepted"; fi
+
+secret_value="$(printf 'token-value\r\n' | (prompt_secret secret 'test'; printf '%s' "$secret"))"
+assert_eq "$secret_value" "token-value"
 
 BACKUP="$TMP/fixture.tar.zst"
 create_backup_archive project fixture "$BACKUP" >/dev/null
@@ -56,6 +89,11 @@ create_backup_archive project fixture "$BACKUP" >/dev/null
 RESTORE_TMP="$TMP/validate"
 mkdir -p "$RESTORE_TMP/extract"
 validate_backup_archive "$BACKUP" "$RESTORE_TMP" >/dev/null
+
+HOST_BACKUP="$TMP/host.tar.zst"
+create_backup_archive host "" "$HOST_BACKUP" >/dev/null
+validate_backup_archive "$HOST_BACKUP" "$TMP/host-validate" >/dev/null
+assert_jq "$TMP/host-validate/extract/backup.json" '.kind == "host"'
 assert_jq "$RESTORE_TMP/extract/backup.json" '.kind == "project" and .secret_free == true'
 if find "$RESTORE_TMP/extract" -type f \( -name '.runner' -o -name '.credentials*' \) | grep -q .; then
   fail "credential material found in backup"

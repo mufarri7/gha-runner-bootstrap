@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           test_home="$(mktemp -d)"
-          chown nobody:nogroup "${test_home}"
+          sudo chown nobody:nogroup "${test_home}"
           sudo -u nobody env \
             HOME="${test_home}" \
             GHRCTL_STATE_DIR="${test_home}/state" \
